@@ -182,33 +182,90 @@ fn broadcast_embed_to_mask(embeds: &Tensor, mask: &Tensor) -> Result<Tensor> {
     let (b_sz, seq_len) = mask.dims2()?;
     let hidden = embeds.dim(D::Minus1)?;
 
-    // Count masked positions per batch, fill them in sequence from embeds
-    let mask_f32 = mask.to_dtype(DType::F32)?;
-    // cumsum along seq dimension to assign embed indices
-    // Since candle doesn't have cumsum, we use a broadcast approach:
-    // Create output tensor of zeros, then use where_cond
     let zeros = Tensor::zeros((b_sz, seq_len, hidden), embeds.dtype(), embeds.device())?;
-
-    // For single-batch simple case, just expand embeds to the output shape
-    // and let the caller do the masking.
-    if b_sz == 1 {
-        let num_tokens = mask_f32.sum_all()?.to_scalar::<f32>()? as usize;
-        if num_tokens == 0 {
-            return Ok(zeros);
-        }
-        // Pad or truncate embeds to seq_len
-        let embed_len = embeds.dim(0)?;
-        if embed_len >= seq_len {
-            return embeds.narrow(0, 0, seq_len)?.unsqueeze(0);
-        }
-        let padding = Tensor::zeros(
-            (seq_len - embed_len, hidden),
-            embeds.dtype(),
-            embeds.device(),
-        )?;
-        let padded = Tensor::cat(&[embeds, &padding], 0)?;
-        return padded.unsqueeze(0);
+    let mask_values = mask.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    let token_count = mask_values.iter().filter(|&&v| v != 0.0).count();
+    if token_count == 0 {
+        return Ok(zeros);
+    }
+    let embed_len = embeds.dim(0)?;
+    if embed_len != token_count {
+        candle::bail!(
+            "multimodal embedding count {embed_len} does not match mask token count {token_count}"
+        )
     }
 
-    Ok(zeros)
+    let mut next_embed = 0u32;
+    let indices: Vec<u32> = mask_values
+        .iter()
+        .map(|&v| {
+            if v != 0.0 {
+                let idx = next_embed;
+                next_embed += 1;
+                idx
+            } else {
+                0
+            }
+        })
+        .collect();
+    let indices = Tensor::from_vec(indices, b_sz * seq_len, embeds.device())?;
+    let expanded = embeds
+        .index_select(&indices, 0)?
+        .reshape((b_sz, seq_len, hidden))?;
+    let mask = mask
+        .to_dtype(embeds.dtype())?
+        .unsqueeze(D::Minus1)?
+        .broadcast_as(expanded.shape())?;
+    expanded.broadcast_mul(&mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_embed_to_mask_places_single_batch_tokens_at_mask_positions() -> Result<()> {
+        let device = candle::Device::Cpu;
+        let embeds = Tensor::from_vec(vec![10f32, 11., 20., 21.], (2, 2), &device)?;
+        let mask = Tensor::from_vec(vec![0f32, 1., 0., 1.], (1, 4), &device)?;
+        let out = broadcast_embed_to_mask(&embeds, &mask)?;
+        assert_eq!(
+            out.to_vec3::<f32>()?,
+            vec![vec![
+                vec![0., 0.],
+                vec![10., 11.],
+                vec![0., 0.],
+                vec![20., 21.]
+            ]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn broadcast_embed_to_mask_places_multi_batch_tokens_in_row_major_order() -> Result<()> {
+        let device = candle::Device::Cpu;
+        let embeds = Tensor::from_vec(vec![1f32, 2., 3., 4., 5., 6.], (3, 2), &device)?;
+        let mask = Tensor::from_vec(vec![1f32, 0., 1., 0., 1., 0.], (2, 3), &device)?;
+        let out = broadcast_embed_to_mask(&embeds, &mask)?;
+        assert_eq!(
+            out.to_vec3::<f32>()?,
+            vec![
+                vec![vec![1., 2.], vec![0., 0.], vec![3., 4.]],
+                vec![vec![0., 0.], vec![5., 6.], vec![0., 0.]]
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn broadcast_embed_to_mask_rejects_embedding_count_mismatch() -> Result<()> {
+        let device = candle::Device::Cpu;
+        let embeds = Tensor::from_vec(vec![1f32, 2.], (1, 2), &device)?;
+        let mask = Tensor::from_vec(vec![1f32, 0., 1.], (1, 3), &device)?;
+        let err = broadcast_embed_to_mask(&embeds, &mask)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match mask token count"), "{err}");
+        Ok(())
+    }
 }
