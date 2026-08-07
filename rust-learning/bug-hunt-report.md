@@ -1,14 +1,15 @@
-# Candle bug hunt 报告：五十九个 public API 边界修复
+# Candle bug hunt 报告：六十二个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复五十九个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复六十二个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
-和 mask 对齐语义；BUG-057 到 BUG-059 覆盖 Gemma4 audio forward 输入合同。
+和 mask 对齐语义；BUG-057 到 BUG-059 覆盖 Gemma4 audio forward 输入合同；BUG-060 到 BUG-062
+继续覆盖 Gemma4 multimodal/vision 的运行期数量和 pooling 边界。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -78,6 +79,9 @@ Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 mul
 | BUG-057 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | `audio_mel_mask` batch 为 1 时可广播到多个 audio batch | forward 要求 mask batch 精确匹配 audio batch |
 | BUG-058 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | `audio_mel_mask` time 为 1 时可广播到多个 audio frame | forward 要求 mask time 精确匹配 audio time |
 | BUG-059 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | 空 audio time 维会进入后续 conv/subsample 边界 | forward 入口拒绝空 time |
+| BUG-060 | [candle-transformers/src/models/gemma4/mod.rs](../candle-transformers/src/models/gemma4/mod.rs) | encoder 产生 multimodal embedding 但 prompt 没有对应特殊 token 时静默丢特征 | 即使 mask token 数为 0，也校验 embedding 数量一致 |
+| BUG-061 | [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs) | 图像太小导致 `num_patches / (pooling_kernel_size^2) == 0`，pooling 输出无效 | `VisionTower::encode_single` 拒绝零输出 token |
+| BUG-062 | [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs) | `VisionPooler::forward(..., Some(0))` 会进入除零/无效 pooling | pooler 入口拒绝 `output_length = 0` |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -1555,7 +1559,80 @@ cargo test -p candle-transformers models::gemma4::audio::tests
 - `agent/bug-058-gemma4-audio-mask-time-broadcast`
 - `agent/bug-059-gemma4-audio-empty-time-input`
 
-## 五十九个案例教什么
+## BUG-060：Gemma4 modality 输入没有对应特殊 token
+
+受影响文件：
+
+- [candle-transformers/src/models/gemma4/mod.rs](../candle-transformers/src/models/gemma4/mod.rs)
+
+BUG-054 到 BUG-056 修复了 `broadcast_embed_to_mask` 的主要放置逻辑，但还剩一个边界：
+
+```text
+embeds.len() > 0，但 mask 中没有任何 image/audio special token。
+```
+
+这代表调用者给了 image/audio encoder 输出，却没有在 prompt 中留出承载位置。原逻辑在 `token_count == 0`
+时直接返回全 0，等价于静默丢掉这些多模态特征。
+
+修复策略：
+
+- 先计算 `embed_len` 和 `token_count`。
+- 无论 `token_count` 是否为 0，都要求二者相等。
+- 只有 `embed_len == token_count == 0` 时才返回全 0。
+
+新增测试：
+
+- `broadcast_embed_to_mask_rejects_embeddings_without_mask_tokens`
+
+已运行：
+
+```bash
+cargo test -p candle-transformers models::gemma4::tests
+```
+
+分支：
+
+- `agent/bug-060-gemma4-modality-without-token`
+
+## BUG-061 到 BUG-062：Gemma4 vision pooling 零输出长度
+
+受影响文件：
+
+- [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs)
+
+`VisionTower::encode_single` 根据图像 patch 数和 pooling kernel 算输出 token 数：
+
+```rust
+let output_length = num_patches / (k * k);
+```
+
+如果输入图像太小，例如只有 1 个 patch，而 `pooling_kernel_size = 3`，则 `output_length = 0`。
+后续 pooler 会把 0 当成输出长度参与除法和 scatter 输出 shape，语义已经失效。
+
+修复策略：
+
+- `pooling_kernel_size^2` 使用 `checked_mul`，防溢出。
+- pooling kernel area 为 0 时返回错误。
+- `output_length == 0` 时在 `VisionTower` 入口返回清晰错误。
+- `VisionPooler` 自己也拒绝 `output_length = 0`，避免其他调用绕过。
+
+新增测试：
+
+- `vision_tower_rejects_zero_pooling_output_length`
+- `vision_pooler_rejects_zero_output_length`
+
+已运行：
+
+```bash
+cargo test -p candle-transformers models::gemma4::vision::tests
+```
+
+分支：
+
+- `agent/bug-061-gemma4-vision-empty-pooling-output`
+- `agent/bug-062-gemma4-vision-zero-pooler-output-length`
+
+## 六十二个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
