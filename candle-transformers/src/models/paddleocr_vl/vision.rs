@@ -12,6 +12,60 @@ use super::config::VisionConfig;
 /// Default maximum number of cached position embeddings.
 const DEFAULT_POS_EMBED_CACHE_SIZE: usize = 16;
 
+fn validate_grid_thw(
+    grid_thw: &Tensor,
+    spatial_merge_size: usize,
+) -> Result<(Vec<[usize; 3]>, usize)> {
+    let dims = grid_thw.dims();
+    if dims.len() != 2 || dims[1] != 3 {
+        candle::bail!("grid_thw must have shape [N, 3], got {dims:?}");
+    }
+    if dims[0] == 0 {
+        candle::bail!("grid_thw must contain at least one row");
+    }
+    if spatial_merge_size == 0 {
+        candle::bail!("spatial_merge_size must be greater than zero");
+    }
+
+    let grid = grid_thw.to_vec2::<u32>()?;
+    let mut parsed = Vec::with_capacity(grid.len());
+    let mut total_tokens = 0usize;
+
+    for (idx, g) in grid.iter().enumerate() {
+        let t = g[0] as usize;
+        let h = g[1] as usize;
+        let w = g[2] as usize;
+        if t == 0 || h == 0 || w == 0 {
+            candle::bail!(
+                "grid_thw row {idx} values must be greater than zero, got [{t}, {h}, {w}]"
+            );
+        }
+        if h % spatial_merge_size != 0 {
+            candle::bail!(
+                "grid_thw row {idx} height ({h}) must be divisible by spatial_merge_size ({spatial_merge_size})"
+            );
+        }
+        if w % spatial_merge_size != 0 {
+            candle::bail!(
+                "grid_thw row {idx} width ({w}) must be divisible by spatial_merge_size ({spatial_merge_size})"
+            );
+        }
+        let Some(area) = h.checked_mul(w) else {
+            candle::bail!("grid_thw row {idx} area overflows usize");
+        };
+        let Some(tokens) = t.checked_mul(area) else {
+            candle::bail!("grid_thw row {idx} token count overflows usize");
+        };
+        let Some(next_total) = total_tokens.checked_add(tokens) else {
+            candle::bail!("grid_thw total token count overflows usize");
+        };
+        total_tokens = next_total;
+        parsed.push([t, h, w]);
+    }
+
+    Ok((parsed, total_tokens))
+}
+
 /// LFU (Least Frequently Used) cache for interpolated position embeddings.
 ///
 /// Caches interpolated position embeddings keyed by (height, width) grid dimensions.
@@ -711,16 +765,20 @@ impl Projector {
     pub fn forward(&self, xs: &Tensor, grid_thw: &Tensor) -> Result<Tensor> {
         let normed = self.pre_norm.forward(xs)?;
 
-        let grid = grid_thw.to_vec2::<u32>()?;
         let m = self.spatial_merge_size;
+        let (grid, expected_tokens) = validate_grid_thw(grid_thw, m)?;
+        let actual_tokens = normed.dim(0)?;
+        if actual_tokens != expected_tokens {
+            candle::bail!(
+                "pixel token count ({actual_tokens}) must match grid_thw token count ({expected_tokens})"
+            );
+        }
 
         let mut merged_features = Vec::new();
         let mut offset = 0usize;
 
         for g in &grid {
-            let t = g[0] as usize;
-            let h = g[1] as usize;
-            let w = g[2] as usize;
+            let [t, h, w] = *g;
             let seq_len = t * h * w;
 
             // Extract this image's features
@@ -786,16 +844,20 @@ impl Projector {
     pub fn forward_multi(&self, xs: &Tensor, grid_thw: &Tensor) -> Result<Vec<Tensor>> {
         let normed = self.pre_norm.forward(xs)?;
 
-        let grid = grid_thw.to_vec2::<u32>()?;
         let m = self.spatial_merge_size;
+        let (grid, expected_tokens) = validate_grid_thw(grid_thw, m)?;
+        let actual_tokens = normed.dim(0)?;
+        if actual_tokens != expected_tokens {
+            candle::bail!(
+                "pixel token count ({actual_tokens}) must match grid_thw token count ({expected_tokens})"
+            );
+        }
 
         let mut result = Vec::with_capacity(grid.len());
         let mut offset = 0usize;
 
         for g in &grid {
-            let t = g[0] as usize;
-            let h = g[1] as usize;
-            let w = g[2] as usize;
+            let [t, h, w] = *g;
             let seq_len = t * h * w;
 
             // Extract this image's features
@@ -858,6 +920,7 @@ pub struct VisionModel {
     rotary_pos_emb: VisionRotaryEmbedding,
     hidden_size: usize,
     patch_size: usize,
+    spatial_merge_size: usize,
 }
 
 impl VisionModel {
@@ -898,7 +961,18 @@ impl VisionModel {
             rotary_pos_emb,
             hidden_size: vision_cfg.hidden_size,
             patch_size: vision_cfg.patch_size,
+            spatial_merge_size: vision_cfg.spatial_merge_size,
         })
+    }
+
+    fn validate_pixel_grid_tokens(&self, pixel_tokens: usize, grid_thw: &Tensor) -> Result<()> {
+        let (_, expected_tokens) = validate_grid_thw(grid_thw, self.spatial_merge_size)?;
+        if pixel_tokens != expected_tokens {
+            candle::bail!(
+                "pixel token count ({pixel_tokens}) must match grid_thw token count ({expected_tokens})"
+            );
+        }
+        Ok(())
     }
 
     /// Compute 2D rotary position embeddings for variable-size grids.
@@ -908,7 +982,7 @@ impl VisionModel {
     /// row = i // width, col = i % width.
     fn rot_pos_emb(&self, grid_thw: &Tensor) -> Result<Tensor> {
         let device = self.rotary_pos_emb.inv_freq.device();
-        let grid = grid_thw.to_vec2::<u32>()?;
+        let (grid, _) = validate_grid_thw(grid_thw, self.spatial_merge_size)?;
 
         // Find max grid dimension to build frequency table
         let max_hw = grid
@@ -916,7 +990,7 @@ impl VisionModel {
             .flat_map(|v| v[1..3].iter())
             .copied()
             .max()
-            .unwrap_or(0) as usize;
+            .unwrap_or(0);
         let freq_table = self.rotary_pos_emb.make_embeds(max_hw)?;
 
         // Build position indices using simple raster order
@@ -927,9 +1001,7 @@ impl VisionModel {
         let mut cols = Vec::new();
 
         for g in &grid {
-            let t = g[0] as usize;
-            let h = g[1] as usize;
-            let w = g[2] as usize;
+            let [t, h, w] = *g;
 
             // For each temporal frame, patches are in raster order
             for _ in 0..t {
@@ -957,14 +1029,26 @@ impl VisionModel {
 
     /// Build cumulative sequence lengths for variable-length attention.
     fn build_cu_seqlens(&self, grid_thw: &Tensor) -> Result<Vec<usize>> {
-        let grid = grid_thw.to_vec2::<u32>()?;
-        let mut cu = Vec::with_capacity(grid.iter().map(|v| v[0] as usize).sum::<usize>() + 1);
+        let (grid, _) = validate_grid_thw(grid_thw, self.spatial_merge_size)?;
+        let frame_count = grid
+            .iter()
+            .try_fold(1usize, |acc, [t, _, _]| acc.checked_add(*t));
+        let Some(frame_count) = frame_count else {
+            candle::bail!("grid_thw frame count overflows usize");
+        };
+        let mut cu = Vec::with_capacity(frame_count);
         cu.push(0usize);
         let mut acc = 0usize;
         for g in &grid {
-            let area = (g[1] * g[2]) as usize;
-            for _ in 0..(g[0] as usize) {
-                acc += area;
+            let [t, h, w] = *g;
+            let Some(area) = h.checked_mul(w) else {
+                candle::bail!("grid_thw area overflows usize");
+            };
+            for _ in 0..t {
+                let Some(next_acc) = acc.checked_add(area) else {
+                    candle::bail!("grid_thw cumulative sequence length overflows usize");
+                };
+                acc = next_acc;
                 cu.push(acc);
             }
         }
@@ -995,6 +1079,7 @@ impl VisionModel {
         // Get patch embeddings
         let hidden_states = self.embeddings.forward(pixel_values)?;
         let hidden_states = hidden_states.reshape(((), self.hidden_size))?;
+        self.validate_pixel_grid_tokens(hidden_states.dim(0)?, grid_thw)?;
 
         if debug {
             let hs_f32 = hidden_states.to_dtype(DType::F32)?;
@@ -1080,6 +1165,7 @@ impl VisionModel {
         // Get patch embeddings
         let hidden_states = self.embeddings.forward(pixel_values)?;
         let hidden_states = hidden_states.reshape(((), self.hidden_size))?;
+        self.validate_pixel_grid_tokens(hidden_states.dim(0)?, grid_thw)?;
 
         // Compute rotary embeddings
         let rotary_pos_emb = self.rot_pos_emb(grid_thw)?;
@@ -1160,6 +1246,7 @@ impl VisionModel {
         let pos_embed = self.embeddings.interpolate_pos_encoding(h, w)?;
         let hidden_states = patch_out.broadcast_add(&pos_embed)?;
         let hidden_states = hidden_states.reshape(((), self.hidden_size))?;
+        self.validate_pixel_grid_tokens(hidden_states.dim(0)?, grid_thw)?;
         exports.insert(
             "embeddings_output".to_string(),
             hidden_states.to_dtype(DType::F32)?,
@@ -1218,5 +1305,150 @@ impl VisionModel {
         exports.insert("projector_output".to_string(), output.to_dtype(DType::F32)?);
 
         Ok((output.to_dtype(dtype)?, exports))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::Activation;
+
+    fn tiny_vision_config() -> VisionConfig {
+        VisionConfig {
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 0,
+            num_attention_heads: 2,
+            num_channels: 3,
+            image_size: 4,
+            patch_size: 1,
+            hidden_act: Activation::GeluPytorchTanh,
+            layer_norm_eps: 1e-6,
+            attention_dropout: 0.0,
+            spatial_merge_size: 2,
+        }
+    }
+
+    fn new_model() -> Result<VisionModel> {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        VisionModel::new(
+            &tiny_vision_config(),
+            8,
+            vb.pp("vision"),
+            vb.pp("projector"),
+        )
+    }
+
+    fn pixel_values(height: usize, width: usize) -> Result<Tensor> {
+        Tensor::zeros((1, 3, height, width), DType::F32, &Device::Cpu)
+    }
+
+    fn grid(values: &[u32], rows: usize, cols: usize) -> Result<Tensor> {
+        Tensor::from_vec(values.to_vec(), (rows, cols), &Device::Cpu)
+    }
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vision_model_rejects_grid_with_too_few_columns() -> Result<()> {
+        let model = new_model()?;
+        let pixel_values = pixel_values(2, 2)?;
+        let grid_thw = grid(&[1, 2], 1, 2)?;
+        assert_err_contains(model.forward(&pixel_values, &grid_thw), "grid_thw");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_grid_with_extra_columns() -> Result<()> {
+        let model = new_model()?;
+        let pixel_values = pixel_values(2, 2)?;
+        let grid_thw = grid(&[1, 2, 2, 99], 1, 4)?;
+        assert_err_contains(model.forward(&pixel_values, &grid_thw), "grid_thw");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_empty_grid() -> Result<()> {
+        let model = new_model()?;
+        let pixel_values = pixel_values(2, 2)?;
+        let grid_thw = Tensor::zeros((0, 3), DType::U32, &Device::Cpu)?;
+        assert_err_contains(model.forward(&pixel_values, &grid_thw), "grid_thw");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_zero_temporal_grid() -> Result<()> {
+        let model = new_model()?;
+        let pixel_values = pixel_values(2, 2)?;
+        let grid_thw = grid(&[0, 2, 2], 1, 3)?;
+        assert_err_contains(model.forward(&pixel_values, &grid_thw), "greater than zero");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_zero_grid_height() -> Result<()> {
+        let model = new_model()?;
+        let pixel_values = pixel_values(2, 2)?;
+        let grid_thw = grid(&[1, 0, 2], 1, 3)?;
+        assert_err_contains(model.forward(&pixel_values, &grid_thw), "greater than zero");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_zero_grid_width() -> Result<()> {
+        let model = new_model()?;
+        let pixel_values = pixel_values(2, 2)?;
+        let grid_thw = grid(&[1, 2, 0], 1, 3)?;
+        assert_err_contains(model.forward(&pixel_values, &grid_thw), "greater than zero");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_grid_height_not_divisible_by_merge() -> Result<()> {
+        let model = new_model()?;
+        let pixel_values = pixel_values(3, 2)?;
+        let grid_thw = grid(&[1, 3, 2], 1, 3)?;
+        assert_err_contains(model.forward(&pixel_values, &grid_thw), "divisible");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_grid_width_not_divisible_by_merge() -> Result<()> {
+        let model = new_model()?;
+        let pixel_values = pixel_values(2, 3)?;
+        let grid_thw = grid(&[1, 2, 3], 1, 3)?;
+        assert_err_contains(model.forward(&pixel_values, &grid_thw), "divisible");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_pixel_grid_token_count_mismatch() -> Result<()> {
+        let model = new_model()?;
+        let pixel_values = pixel_values(2, 2)?;
+        let grid_thw = grid(&[1, 2, 4], 1, 3)?;
+        assert_err_contains(model.forward(&pixel_values, &grid_thw), "pixel token count");
+        Ok(())
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn build_cu_seqlens_uses_usize_grid_area() -> Result<()> {
+        let model = new_model()?;
+        let grid_thw = grid(&[1, 65536, 65536], 1, 3)?;
+        let cu_seqlens = model.build_cu_seqlens(&grid_thw)?;
+        assert_eq!(cu_seqlens, vec![0, 4_294_967_296]);
+        Ok(())
     }
 }
