@@ -10,6 +10,47 @@ use crate::models::qwen3_vl::conv3d_temporal_2::{Conv3dConfig, Conv3dNoBias};
 
 use super::config::VisionConfig;
 
+fn validate_attention_geometry(dim: usize, num_heads: usize) -> Result<usize> {
+    if dim == 0 {
+        candle::bail!("hidden_size must be greater than zero")
+    }
+    if num_heads == 0 {
+        candle::bail!("num_heads must be greater than zero")
+    }
+    if dim % num_heads != 0 {
+        candle::bail!(
+            "hidden_size must be divisible by num_heads, got hidden_size={dim} and num_heads={num_heads}"
+        )
+    }
+    let head_dim = dim / num_heads;
+    if head_dim == 0 || head_dim % 4 != 0 {
+        candle::bail!(
+            "vision attention head_dim must be a non-zero multiple of 4 for rotary embeddings, got {head_dim}"
+        )
+    }
+    Ok(head_dim)
+}
+
+fn validate_vision_config(cfg: &VisionConfig) -> Result<()> {
+    validate_attention_geometry(cfg.hidden_size, cfg.num_heads)?;
+    if cfg.patch_size == 0 {
+        candle::bail!("patch_size must be greater than zero")
+    }
+    if cfg.temporal_patch_size == 0 {
+        candle::bail!("temporal_patch_size must be greater than zero")
+    }
+    if cfg.spatial_merge_size == 0 {
+        candle::bail!("spatial_merge_size must be greater than zero")
+    }
+    let Some(_) = cfg.spatial_merge_size.checked_mul(cfg.spatial_merge_size) else {
+        candle::bail!("spatial_merge_size squared overflows")
+    };
+    if cfg.num_position_embeddings == 0 {
+        candle::bail!("num_position_embeddings must be greater than zero")
+    }
+    Ok(())
+}
+
 struct PatchEmbed {
     proj: Conv3dNoBias,
     bias: Tensor,
@@ -110,11 +151,12 @@ struct VisionAttention {
 
 impl VisionAttention {
     fn new(dim: usize, num_heads: usize, vb: VarBuilder) -> Result<Self> {
+        let head_dim = validate_attention_geometry(dim, num_heads)?;
         Ok(Self {
             qkv: linear(dim, dim * 3, vb.pp("qkv"))?,
             proj: linear(dim, dim, vb.pp("proj"))?,
             num_heads,
-            head_dim: dim / num_heads,
+            head_dim,
         })
     }
 
@@ -318,6 +360,7 @@ pub struct Qwen3VLVisionModel {
 
 impl Qwen3VLVisionModel {
     pub fn new(cfg: &VisionConfig, vb: VarBuilder) -> Result<Self> {
+        validate_vision_config(cfg)?;
         let patch_embed = PatchEmbed::new(cfg, vb.pp("patch_embed"))?;
         let pos_embed = embedding(
             cfg.num_position_embeddings,
@@ -581,5 +624,93 @@ impl Qwen3VLVisionModel {
 
         let hidden_states = self.merger.forward(&hidden_states)?;
         Ok((hidden_states, deepstack_features))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_config() -> VisionConfig {
+        VisionConfig {
+            depth: 0,
+            hidden_size: 4,
+            out_hidden_size: 4,
+            hidden_act: Activation::Gelu,
+            intermediate_size: 8,
+            num_heads: 1,
+            in_chans: 3,
+            patch_size: 2,
+            spatial_merge_size: 1,
+            temporal_patch_size: 1,
+            num_position_embeddings: 4,
+            deepstack_visual_indexes: Vec::new(),
+        }
+    }
+
+    fn assert_new_err_contains(cfg: VisionConfig, expected: &str) {
+        let device = Device::Cpu;
+        let err = match Qwen3VLVisionModel::new(
+            &cfg,
+            VarBuilder::zeros(DType::F32, &device).pp("vision"),
+        ) {
+            Ok(_) => panic!("expected Qwen3VLVisionModel::new to fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains(expected),
+            "expected error containing {expected:?}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vision_model_rejects_zero_num_heads() {
+        let mut cfg = tiny_config();
+        cfg.num_heads = 0;
+        assert_new_err_contains(cfg, "num_heads must be greater than zero");
+    }
+
+    #[test]
+    fn vision_model_rejects_hidden_size_not_divisible_by_heads() {
+        let mut cfg = tiny_config();
+        cfg.hidden_size = 6;
+        cfg.num_heads = 4;
+        assert_new_err_contains(cfg, "hidden_size must be divisible by num_heads");
+    }
+
+    #[test]
+    fn vision_model_rejects_invalid_rotary_head_dim() {
+        let mut cfg = tiny_config();
+        cfg.hidden_size = 6;
+        cfg.num_heads = 1;
+        assert_new_err_contains(cfg, "head_dim must be a non-zero multiple of 4");
+    }
+
+    #[test]
+    fn vision_model_rejects_zero_patch_size() {
+        let mut cfg = tiny_config();
+        cfg.patch_size = 0;
+        assert_new_err_contains(cfg, "patch_size must be greater than zero");
+    }
+
+    #[test]
+    fn vision_model_rejects_zero_temporal_patch_size() {
+        let mut cfg = tiny_config();
+        cfg.temporal_patch_size = 0;
+        assert_new_err_contains(cfg, "temporal_patch_size must be greater than zero");
+    }
+
+    #[test]
+    fn vision_model_rejects_zero_spatial_merge_size() {
+        let mut cfg = tiny_config();
+        cfg.spatial_merge_size = 0;
+        assert_new_err_contains(cfg, "spatial_merge_size must be greater than zero");
+    }
+
+    #[test]
+    fn vision_model_rejects_zero_position_embeddings() {
+        let mut cfg = tiny_config();
+        cfg.num_position_embeddings = 0;
+        assert_new_err_contains(cfg, "num_position_embeddings must be greater than zero");
     }
 }
