@@ -8,6 +8,48 @@ use candle_nn::{Activation, Linear, VarBuilder};
 
 use super::config::Gemma4VisionConfig;
 
+fn validate_2d_rope_head_dim(head_dim: usize, ndim: usize) -> Result<()> {
+    if ndim == 0 {
+        candle::bail!("rotary embedding ndim must be greater than zero")
+    }
+    let required_multiple = 2 * ndim;
+    if head_dim == 0 || head_dim % required_multiple != 0 {
+        candle::bail!(
+            "head_dim must be a non-zero multiple of {required_multiple} for {ndim}d rotary embeddings, got {head_dim}"
+        )
+    }
+    Ok(())
+}
+
+fn validate_vision_attention_config(cfg: &Gemma4VisionConfig) -> Result<()> {
+    if cfg.num_attention_heads == 0 {
+        candle::bail!("num_attention_heads must be greater than zero")
+    }
+    if cfg.num_key_value_heads == 0 {
+        candle::bail!("num_key_value_heads must be greater than zero")
+    }
+    if cfg.num_attention_heads % cfg.num_key_value_heads != 0 {
+        candle::bail!(
+            "num_attention_heads must be divisible by num_key_value_heads, got num_attention_heads={} and num_key_value_heads={}",
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads
+        )
+    }
+    Ok(())
+}
+
+fn validate_vision_config(cfg: &Gemma4VisionConfig) -> Result<()> {
+    validate_vision_attention_config(cfg)?;
+    validate_2d_rope_head_dim(cfg.head_dim, 2)?;
+    if cfg.patch_size == 0 {
+        candle::bail!("patch_size must be greater than zero")
+    }
+    if cfg.pooling_kernel_size == 0 {
+        candle::bail!("pooling_kernel_size must be greater than zero")
+    }
+    Ok(())
+}
+
 // ── RmsNorm (Gemma-style) ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -59,6 +101,7 @@ struct VisionRotaryEmbedding {
 
 impl VisionRotaryEmbedding {
     fn new(head_dim: usize, theta: f64, ndim: usize, device: &Device) -> Result<Self> {
+        validate_2d_rope_head_dim(head_dim, ndim)?;
         let dim_per_dim = head_dim / ndim;
         let half = dim_per_dim / 2;
         let inv_freq: Vec<f32> = (0..half)
@@ -123,6 +166,9 @@ struct PatchEmbedder {
 impl PatchEmbedder {
     fn new(cfg: &Gemma4VisionConfig, vb: VarBuilder) -> Result<Self> {
         let ps = cfg.patch_size;
+        if ps == 0 {
+            candle::bail!("patch_size must be greater than zero")
+        }
         let input_proj =
             candle_nn::linear_no_bias(ps * ps * 3, cfg.hidden_size, vb.pp("input_proj"))?;
         let position_embedding_table = vb.get(
@@ -201,6 +247,7 @@ struct VisionAttention {
 
 impl VisionAttention {
     fn new(cfg: &Gemma4VisionConfig, vb: VarBuilder) -> Result<Self> {
+        validate_vision_attention_config(cfg)?;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
         let head_dim = cfg.head_dim;
@@ -450,6 +497,7 @@ pub struct VisionTower {
 
 impl VisionTower {
     pub fn new(cfg: &Gemma4VisionConfig, vb: VarBuilder) -> Result<Self> {
+        validate_vision_config(cfg)?;
         let patch_embedder = PatchEmbedder::new(cfg, vb.pp("patch_embedder"))?;
 
         let mut encoder_layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -527,6 +575,9 @@ impl VisionTower {
 
     /// Encode a batch of images (each may have different sizes).
     pub fn forward(&self, pixel_values_list: &[Tensor]) -> Result<Tensor> {
+        if pixel_values_list.is_empty() {
+            candle::bail!("pixel_values_list must not be empty")
+        }
         let device = pixel_values_list[0].device().clone();
         let dtype = pixel_values_list[0].dtype();
 
@@ -548,5 +599,103 @@ impl VisionTower {
         }
 
         hidden_states.unsqueeze(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::{Activation, VarBuilder};
+
+    fn tiny_config() -> Gemma4VisionConfig {
+        Gemma4VisionConfig {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            hidden_activation: Activation::GeluPytorchTanh,
+            rms_norm_eps: 1e-6,
+            patch_size: 2,
+            position_embedding_size: 4,
+            pooling_kernel_size: 1,
+            default_output_length: 1,
+            standardize: false,
+            rope_parameters: None,
+        }
+    }
+
+    fn assert_err_contains<T: std::fmt::Debug>(result: Result<T>, expected: &str) {
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(expected),
+            "expected error containing {expected:?}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn vision_attention_rejects_zero_key_value_heads() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.num_key_value_heads = 0;
+        assert_err_contains(
+            VisionAttention::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("attn")),
+            "num_key_value_heads must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn vision_attention_rejects_non_divisible_key_value_heads() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.num_attention_heads = 3;
+        cfg.num_key_value_heads = 2;
+        assert_err_contains(
+            VisionAttention::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("attn")),
+            "num_attention_heads must be divisible by num_key_value_heads",
+        );
+    }
+
+    #[test]
+    fn vision_tower_rejects_zero_patch_size() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.patch_size = 0;
+        assert_err_contains(
+            VisionTower::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("vision")),
+            "patch_size must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn vision_tower_rejects_zero_pooling_kernel_size() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.pooling_kernel_size = 0;
+        assert_err_contains(
+            VisionTower::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("vision")),
+            "pooling_kernel_size must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn vision_tower_rejects_invalid_rope_head_dim() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.head_dim = 6;
+        assert_err_contains(
+            VisionTower::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("vision")),
+            "head_dim must be a non-zero multiple of 4",
+        );
+    }
+
+    #[test]
+    fn vision_tower_rejects_empty_image_batch() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = tiny_config();
+        let tower = VisionTower::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("vision"))?;
+        assert_err_contains(tower.forward(&[]), "pixel_values_list must not be empty");
+        Ok(())
     }
 }
