@@ -388,6 +388,9 @@ impl VisionPooler {
         patch_positions: &Tensor,
         output_length: usize,
     ) -> Result<Tensor> {
+        if output_length == 0 {
+            candle::bail!("vision pooling output_length must be greater than zero")
+        }
         let (b, num_patches, dim) = x.dims3()?;
         let k = ((num_patches as f64 / output_length as f64).sqrt()) as i64;
         let k_sq = k * k;
@@ -517,7 +520,18 @@ impl VisionTower {
 
         // Pool
         let k = self.pooling_kernel_size;
-        let output_length = num_patches / (k * k);
+        let Some(pooling_area) = k.checked_mul(k) else {
+            candle::bail!("vision pooling kernel area overflow")
+        };
+        if pooling_area == 0 {
+            candle::bail!("vision pooling kernel size must be greater than zero")
+        }
+        let output_length = num_patches / pooling_area;
+        if output_length == 0 {
+            candle::bail!(
+                "vision pooling would produce zero output tokens, got {num_patches} patches and pooling kernel size {k}"
+            )
+        }
         let pooled = self
             .pooler
             .forward(&hidden_states, &positions, Some(output_length))?;
@@ -548,5 +562,61 @@ impl VisionTower {
         }
 
         hidden_states.unsqueeze(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_config() -> Gemma4VisionConfig {
+        Gemma4VisionConfig {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 4,
+            hidden_activation: Activation::GeluPytorchTanh,
+            rms_norm_eps: 1e-6,
+            patch_size: 2,
+            position_embedding_size: 4,
+            pooling_kernel_size: 3,
+            default_output_length: 1,
+            standardize: false,
+            rope_parameters: None,
+        }
+    }
+
+    #[test]
+    fn vision_tower_rejects_zero_pooling_output_length() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = tiny_config();
+        let tower = VisionTower::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("vision"))?;
+        let pixel_values = Tensor::zeros((1, 3, 2, 2), DType::F32, &device)?;
+        let err = tower.forward(&[pixel_values]).unwrap_err().to_string();
+        assert!(
+            err.contains("vision pooling would produce zero output tokens"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vision_pooler_rejects_zero_output_length() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = tiny_config();
+        let pooler = VisionPooler::new(&cfg);
+        let hidden_states = Tensor::zeros((1, 1, 4), DType::F32, &device)?;
+        let patch_positions = Tensor::zeros((1, 1, 2), DType::I64, &device)?;
+        let err = pooler
+            .forward(&hidden_states, &patch_positions, Some(0))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("vision pooling output_length must be greater than zero"),
+            "{err}"
+        );
+        Ok(())
     }
 }
