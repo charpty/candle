@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：20 个 public API 边界</h2>
+          <h2>真实修复：44 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -261,6 +261,22 @@
             <p>`llama2_c`、Granite、Voxtral loader 去掉 block 加载 `unwrap()`，缺权重返回可定位错误。</p>
           </article>
           <article class="bug-card">
+            <h3>BUG-021/023</h3>
+            <p>BatchNorm 拒绝单样本训练态统计，loss 函数在入口处理空 batch 和非法 Huber `delta`。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-024/031</h3>
+            <p>Mimi transformer 在构造期校验 heads、`kv_repeat`、`d_model`，Sin 位置编码避免下溢和 NaN。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-032/037</h3>
+            <p>Gemma4 vision 校验 KV heads、patch/pooling、2D RoPE head dim，并拒绝空 image batch。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-038/044</h3>
+            <p>Gemma4 text 按 layer 类型校验 local/global KV heads 和 head dim，拒绝非法 RoPE factor 与空 token 序列。</p>
+          </article>
+          <article class="bug-card">
             <h3>审计方法</h3>
             <p>先看 public API 签名，再找 `usize` 除法/减法、index、`unwrap()`、shape 假设、配置派生和失败半更新。</p>
           </article>
@@ -274,6 +290,11 @@
           <pre><code>cargo test -p candle-transformers models::llama2_c::tests</code></pre>
           <pre><code>cargo test -p candle-transformers models::granite::tests</code></pre>
           <pre><code>cargo test -p candle-transformers models::voxtral::voxtral_llama::tests</code></pre>
+          <pre><code>cargo test -p candle-nn --test batch_norm</code></pre>
+          <pre><code>cargo test -p candle-nn --test loss</code></pre>
+          <pre><code>cargo test -p candle-transformers models::mimi::transformer::tests</code></pre>
+          <pre><code>cargo test -p candle-transformers models::gemma4::vision::tests</code></pre>
+          <pre><code>cargo test -p candle-transformers models::gemma4::text::tests</code></pre>
         </div>
       </section>
 

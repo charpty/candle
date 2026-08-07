@@ -172,7 +172,7 @@ const checklist = [
   ["能定位权重路径错误", "从 VarBuilder 路径推导 checkpoint key。"],
   ["能讲清 dtype/layout", "知道 token ids、hidden、logits 的 dtype 和 contiguous 成本。"],
   ["能解释 EOS 语义", "停止检查位置和输出是否保留 EOS。"],
-  ["能复盘真实 bug", "解释 ops、conv groups、loader unwrap、KV cache 原子性和配置除零边界。"],
+  ["能复盘真实 bug", "解释 ops、conv groups、loader unwrap、KV cache 原子性、loss/BatchNorm、Mimi 和 Gemma4 配置边界。"],
   ["能跑完整验证", "测试、trace、layout、backend、cache compare 都能跑。"],
 ];
 

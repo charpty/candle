@@ -1,10 +1,12 @@
-# Candle bug hunt 报告：二十个 public API 边界修复
+# Candle bug hunt 报告：四十四个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复二十个问题：
+本轮累计修复四十四个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
+这些更贴近模型配置和训练/推理边界的路径。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -35,6 +37,30 @@
 | BUG-018 | [candle-transformers/src/models/granite.rs](../candle-transformers/src/models/granite.rs) | `Granite::Cache::new` 对 `num_attention_heads = 0` 除零 | 构造 RoPE cache 前校验 head 配置 |
 | BUG-019 | [candle-transformers/src/models/granite.rs](../candle-transformers/src/models/granite.rs) | `Granite::load` block 加载 `unwrap()` | 缺 block 权重返回 `Err` 而不是 panic |
 | BUG-020 | [candle-transformers/src/models/voxtral/voxtral_llama.rs](../candle-transformers/src/models/voxtral/voxtral_llama.rs) | `VoxtralLlama::load` block 加载 `unwrap()` | 缺 block 权重返回 `Err` 而不是 panic |
+| BUG-021 | [candle-nn/src/batch_norm.rs](../candle-nn/src/batch_norm.rs) | BatchNorm training 每通道只有一个样本时会计算非有限 running variance | 训练路径拒绝 `batch_size <= 1`，失败前不污染状态 |
+| BUG-022 | [candle-nn/src/loss.rs](../candle-nn/src/loss.rs) | `nll` / `cross_entropy` 空 batch 可能除零或先触发间接 reduce 错误 | 在 loss 入口拒绝空 target batch |
+| BUG-023 | [candle-nn/src/loss.rs](../candle-nn/src/loss.rs) | `huber` 接收 `delta <= 0`，可能产生无意义甚至负 loss | 要求 `delta > 0` |
+| BUG-024 | [candle-transformers/src/models/mimi/transformer.rs](../candle-transformers/src/models/mimi/transformer.rs) | Mimi self-attention `num_heads = 0` 构造期除零 | attention 配置先校验 heads 非零 |
+| BUG-025 | [candle-transformers/src/models/mimi/transformer.rs](../candle-transformers/src/models/mimi/transformer.rs) | Mimi self-attention `kv_repeat = 0` 构造期除零 | attention 配置先校验 `kv_repeat > 0` |
+| BUG-026 | [candle-transformers/src/models/mimi/transformer.rs](../candle-transformers/src/models/mimi/transformer.rs) | Mimi `d_model % num_heads != 0` 时 head dim 静默截断或后续 reshape 错 | 构造阶段要求 `d_model` 可被 heads 整除 |
+| BUG-027 | [candle-transformers/src/models/mimi/transformer.rs](../candle-transformers/src/models/mimi/transformer.rs) | Mimi `num_heads % kv_repeat != 0` 时 KV head 数静默截断 | 构造阶段要求 heads 可被 `kv_repeat` 整除 |
+| BUG-028 | [candle-transformers/src/models/mimi/transformer.rs](../candle-transformers/src/models/mimi/transformer.rs) | Mimi cross-attention `kv_repeat = 0` 同样除零 | cross-attention 复用 attention 配置校验 |
+| BUG-029 | [candle-transformers/src/models/mimi/transformer.rs](../candle-transformers/src/models/mimi/transformer.rs) | `StreamingTransformer::new` 接受 0 层，forward 时访问 `layers[0]` panic | 构造阶段拒绝 `num_layers = 0` |
+| BUG-030 | [candle-transformers/src/models/mimi/transformer.rs](../candle-transformers/src/models/mimi/transformer.rs) | Mimi Sin 位置编码输入通道 `< 2` 时 `half_dim - 1` 下溢 | forward 入口拒绝过小通道数 |
+| BUG-031 | [candle-transformers/src/models/mimi/transformer.rs](../candle-transformers/src/models/mimi/transformer.rs) | Mimi Sin 位置编码 2 通道时出现 `0/0`，输出 NaN | `half_dim == 1` 使用有限频率 |
+| BUG-032 | [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs) | Gemma4 vision attention `num_key_value_heads = 0` 构造期除零 | 构造前校验 KV heads 非零 |
+| BUG-033 | [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs) | Gemma4 vision attention heads/KV heads 不整除时静默丢组 | 要求 `num_attention_heads % num_key_value_heads == 0` |
+| BUG-034 | [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs) | Gemma4 `patch_size = 0` 构造可通过，forward 时除零 | `VisionTower::new` / `PatchEmbedder::new` 拒绝零 patch |
+| BUG-035 | [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs) | Gemma4 `pooling_kernel_size = 0` forward 时除零 | 构造阶段拒绝零 pooling kernel |
+| BUG-036 | [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs) | Gemma4 2D RoPE `head_dim` 非 4 的倍数时位置编码维度错配 | 要求 `head_dim` 是 `2 * ndim` 的非零倍数 |
+| BUG-037 | [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs) | `VisionTower::forward(&[])` 直接访问第 0 张图 panic | 空 image batch 返回 `Err` |
+| BUG-038 | [candle-transformers/src/models/gemma4/text.rs](../candle-transformers/src/models/gemma4/text.rs) | Gemma4 text sliding attention `num_key_value_heads = 0` 除零 | 按 layer 类型校验选中的 KV heads |
+| BUG-039 | [candle-transformers/src/models/gemma4/text.rs](../candle-transformers/src/models/gemma4/text.rs) | Gemma4 text heads/KV heads 不整除时静默截断 GQA group | 要求 attention heads 可被 KV heads 整除 |
+| BUG-040 | [candle-transformers/src/models/gemma4/text.rs](../candle-transformers/src/models/gemma4/text.rs) | Gemma4 text global KV heads 为 0 时 full attention 除零 | 校验 `num_global_key_value_heads` |
+| BUG-041 | [candle-transformers/src/models/gemma4/text.rs](../candle-transformers/src/models/gemma4/text.rs) | Gemma4 text local `head_dim = 0` 可构造无效 RoPE/attention | 构造前校验 local head dim |
+| BUG-042 | [candle-transformers/src/models/gemma4/text.rs](../candle-transformers/src/models/gemma4/text.rs) | Gemma4 text global `head_dim = 0` 可构造无效 global RoPE | 构造前校验 global head dim |
+| BUG-043 | [candle-transformers/src/models/gemma4/text.rs](../candle-transformers/src/models/gemma4/text.rs) | `partial_rotary_factor > 1` 使 `half_dim - rope_angles` 下溢 panic | 要求 rotary factor 有限且在 `[0, 1]` |
+| BUG-044 | [candle-transformers/src/models/gemma4/text.rs](../candle-transformers/src/models/gemma4/text.rs) | `TextModel::forward` 空 token 序列在 `seq_len - 1` 下溢 | forward / forward_embeds 拒绝空序列 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -968,7 +994,361 @@ cargo test -p candle-transformers models::voxtral::voxtral_llama::tests
 
 结果：5 个模型加载/cache 配置测试全部通过。
 
-## 二十个案例教什么
+## BUG-021：BatchNorm training 单样本状态污染
+
+受影响函数：
+
+- [candle-nn/src/batch_norm.rs](../candle-nn/src/batch_norm.rs) 的 `BatchNorm::forward_train`
+
+问题类型：
+
+- BatchNorm 训练态需要每个 channel 至少两个值才能估计无偏方差。
+- 原实现把输入 flatten 成 `[C, N]` 后直接计算 `N / (N - 1)`。
+- 当 `N = 1` 时会得到非有限系数，running variance 被污染。
+
+### 为什么这是 bug
+
+`BatchNorm::forward_train` 返回 `Result<Tensor>`，而且内部会更新 running mean/var。这里不只是“输入非法”：
+如果函数在报错前已经把状态改坏，后续合法 batch 也会被污染。
+
+训练态 BatchNorm 的关键合同是：
+
+```text
+输入合法性先于状态更新
+```
+
+也就是说，所有会影响 running statistics 的边界都必须在 mutation 前完成校验。
+
+### 最小复现
+
+```rust
+let mut bn = candle_nn::batch_norm(1, Default::default(), vb)?;
+let xs = Tensor::new(&[[1f32]], &Device::Cpu)?;
+let err = bn.forward_train(&xs).unwrap_err().to_string();
+assert!(err.contains("more than one value per channel"));
+```
+
+修复前，函数不会稳定返回这个错误，而且 running variance 可能被非有限值污染。
+
+### 修复策略
+
+在 flatten 后读取每通道样本数：
+
+```rust
+let batch_size = x.dim(1)?;
+if batch_size <= 1 {
+    candle::bail!("batch-norm training requires more than one value per channel");
+}
+```
+
+然后再计算 mean、variance 和 running statistics。
+
+新增测试：
+
+- `batch_norm_train_rejects_single_value_per_channel`
+
+已运行：
+
+```bash
+cargo test -p candle-nn --test batch_norm
+```
+
+分支：
+
+- `agent/bug-021-batch-norm-single-value`
+
+## BUG-022 到 BUG-023：loss 函数非法输入
+
+受影响函数：
+
+- [candle-nn/src/loss.rs](../candle-nn/src/loss.rs) 的 `nll`
+- [candle-nn/src/loss.rs](../candle-nn/src/loss.rs) 的 `cross_entropy`
+- [candle-nn/src/loss.rs](../candle-nn/src/loss.rs) 的 `huber`
+
+### BUG-022：空 batch loss
+
+`nll` 中有这类缩放：
+
+```rust
+let scale = -1.0 / b_sz as f64;
+```
+
+当 target batch 为空时，`b_sz = 0`。这不是模型训练中的正常数学对象，应返回清晰错误。
+`cross_entropy` 更隐蔽：它会先进入 `log_softmax`，得到一个较间接的 reduce 错误，而不是告诉用户 target batch 为空。
+
+修复后：
+
+- `nll` 直接拒绝空 target。
+- `cross_entropy` 在 `log_softmax` 之前检查输入 rank 和 batch 长度。
+
+### BUG-023：Huber delta
+
+Huber loss 的 `delta` 是阈值，必须大于 0。原实现接受 `delta <= 0`，会让分段公式失去语义，甚至生成负 loss。
+
+修复后：
+
+```rust
+if delta <= 0. {
+    candle::bail!("huber delta must be greater than zero");
+}
+```
+
+新增测试：
+
+- `nll_and_cross_entropy_reject_empty_batch`
+- `huber_rejects_non_positive_delta`
+
+已运行：
+
+```bash
+cargo test -p candle-nn --test loss
+```
+
+分支：
+
+- `agent/bug-022-nll-empty-batch`
+- `agent/bug-023-huber-delta-validation`
+
+## BUG-024 到 BUG-031：Mimi transformer 配置与 Sin 位置编码
+
+受影响文件：
+
+- [candle-transformers/src/models/mimi/transformer.rs](../candle-transformers/src/models/mimi/transformer.rs)
+
+这组问题来自同一个审计模式：构造函数返回 `Result<Self>`，但派生配置时先做除法、取模或索引。
+
+### Attention head 配置
+
+原 self-attention 和 cross-attention 构造路径都会计算：
+
+```rust
+let num_kv = cfg.num_heads / cfg.kv_repeat;
+let kv_dim = num_kv * (embed_dim / cfg.num_heads);
+```
+
+这里有四类问题：
+
+- `num_heads = 0`：`embed_dim / cfg.num_heads` 除零。
+- `kv_repeat = 0`：`cfg.num_heads / cfg.kv_repeat` 除零。
+- `d_model % num_heads != 0`：head dim 被整数除法截断。
+- `num_heads % kv_repeat != 0`：KV head 数被截断，GQA 语义错。
+
+修复策略是新增统一校验：
+
+```rust
+validate_attention_config(cfg)?;
+```
+
+这个 helper 在 self-attention、cross-attention 和 `StreamingTransformer::new` 都会调用。
+
+### 0 层 StreamingTransformer
+
+`StreamingTransformer::new` 原来允许 `num_layers = 0`，但 forward 中直接访问：
+
+```rust
+let pos = self.layers[0].self_attn.kv_cache.current_seq_len();
+```
+
+这是 public 构造成功、第一次 forward 才 panic 的典型边界 bug。修复为构造阶段拒绝 0 层。
+
+### Sin 位置编码
+
+Sin 分支按 runtime channel 数计算：
+
+```rust
+let half_dim = c / 2;
+theta.powf(i as f32 / (half_dim - 1) as f32)
+```
+
+两个边界都不安全：
+
+- `c < 2` 时 `half_dim - 1` 下溢。
+- `c = 2` 时 `half_dim = 1`，分母是 0，`0 / 0` 生成 NaN。
+
+修复后：
+
+- `c < 2` 返回错误。
+- 奇数 channel 返回错误，因为生成的 sin/cos 拼接维度无法匹配原 channel。
+- `half_dim == 1` 使用 `vec![1f32]`，避免 NaN。
+
+新增测试：
+
+- `self_attention_rejects_zero_num_heads`
+- `self_attention_rejects_zero_kv_repeat`
+- `self_attention_rejects_non_divisible_model_width`
+- `self_attention_rejects_non_divisible_kv_repeat`
+- `cross_attention_rejects_zero_kv_repeat`
+- `streaming_transformer_rejects_zero_layers`
+- `sinusoidal_embedding_rejects_too_few_channels`
+- `sinusoidal_embedding_with_two_channels_stays_finite`
+
+已运行：
+
+```bash
+cargo test -p candle-transformers models::mimi::transformer::tests
+```
+
+分支：
+
+- `agent/bug-024-mimi-zero-num-heads`
+- `agent/bug-025-mimi-zero-kv-repeat`
+- `agent/bug-026-mimi-dmodel-head-divisibility`
+- `agent/bug-027-mimi-kvrepeat-head-divisibility`
+- `agent/bug-028-mimi-cross-attn-zero-kvrepeat`
+- `agent/bug-029-mimi-zero-layers`
+- `agent/bug-030-mimi-sin-small-channel-panic`
+- `agent/bug-031-mimi-sin-two-channel-nan`
+
+## BUG-032 到 BUG-037：Gemma4 vision 输入与配置
+
+受影响文件：
+
+- [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs)
+
+### Attention KV heads
+
+Vision attention 原来直接保存：
+
+```rust
+num_kv_groups: num_heads / num_kv_heads
+```
+
+`num_kv_heads = 0` 会 panic；`num_heads` 不能被 `num_kv_heads` 整除时，GQA group 会被截断。
+修复后构造前校验：
+
+- `num_attention_heads > 0`
+- `num_key_value_heads > 0`
+- `num_attention_heads % num_key_value_heads == 0`
+
+### patch / pooling 配置
+
+`patch_size = 0` 和 `pooling_kernel_size = 0` 都能通过构造，但 forward 会分别在 patchify 和 pooling 输出长度计算中除零。
+修复后 `VisionTower::new` 阶段拒绝它们；`PatchEmbedder::new` 也单独拒绝零 patch size。
+
+### 2D RoPE head_dim
+
+Gemma4 vision 的 2D RoPE 会把 head dim 分配给两个空间维度，并在每个维度里做 rotate-half。
+所以 `head_dim` 必须是 `2 * ndim` 的非零倍数；在当前 2D 场景下就是 4 的倍数。
+
+否则 cos/sin 的最后一维和 Q/K 的最后一维无法对齐，错误会延迟到 forward。修复为构造期报错。
+
+### 空 image batch
+
+`VisionTower::forward` 原来第一行就读取：
+
+```rust
+let device = pixel_values_list[0].device().clone();
+```
+
+空切片会 panic。修复为：
+
+```rust
+if pixel_values_list.is_empty() {
+    candle::bail!("pixel_values_list must not be empty")
+}
+```
+
+新增测试：
+
+- `vision_attention_rejects_zero_key_value_heads`
+- `vision_attention_rejects_non_divisible_key_value_heads`
+- `vision_tower_rejects_zero_patch_size`
+- `vision_tower_rejects_zero_pooling_kernel_size`
+- `vision_tower_rejects_invalid_rope_head_dim`
+- `vision_tower_rejects_empty_image_batch`
+
+已运行：
+
+```bash
+cargo test -p candle-transformers models::gemma4::vision::tests
+```
+
+分支：
+
+- `agent/bug-032-gemma4-vision-zero-kv-heads`
+- `agent/bug-033-gemma4-vision-kv-head-divisibility`
+- `agent/bug-034-gemma4-vision-zero-patch-size`
+- `agent/bug-035-gemma4-vision-zero-pooling-kernel`
+- `agent/bug-036-gemma4-vision-invalid-rope-head-dim`
+- `agent/bug-037-gemma4-vision-empty-image-batch`
+
+## BUG-038 到 BUG-044：Gemma4 text 配置与空序列
+
+受影响文件：
+
+- [candle-transformers/src/models/gemma4/text.rs](../candle-transformers/src/models/gemma4/text.rs)
+
+### Layer 类型决定 KV heads
+
+Gemma4 text 有 sliding attention 和 full/global attention 两类 layer。原代码在 `Attention::new` 中根据 layer 类型选择：
+
+```rust
+let (head_dim, num_kv_heads) = if is_sliding {
+    (cfg.head_dim, cfg.num_key_value_heads)
+} else {
+    (cfg.global_head_dim, global_kv)
+};
+let num_kv_groups = num_heads / num_kv_heads;
+```
+
+风险点：
+
+- sliding KV heads 为 0 会除零。
+- global KV heads 为 0 也会除零。
+- heads/KV heads 不整除会让 GQA group 被截断。
+- local/global head dim 为 0 会构造无效 RoPE 和 attention scale。
+
+修复策略是把“根据 layer 类型选 head_dim/KV heads”抽成 helper，再统一校验。
+
+### partial_rotary_factor
+
+global RoPE 会计算：
+
+```rust
+let rope_angles = (partial_rotary_factor * head_dim as f64 / 2.0) as usize;
+inv_freq_vec.extend(std::iter::repeat_n(0f32, half_dim - rope_angles));
+```
+
+如果 `partial_rotary_factor > 1`，`rope_angles > half_dim`，`half_dim - rope_angles` 下溢 panic。
+修复后要求 factor 有限且在 `[0, 1]`。
+
+### 空 token 序列
+
+`TextModel::forward_embeds` 最后取最后一个 token 的 logits：
+
+```rust
+xs.narrow(1, seq_len - 1, 1)?
+```
+
+当 `seq_len = 0` 时会 `usize` 下溢。修复后 `forward` 和 `forward_embeds` 都先拒绝空序列。
+
+新增测试：
+
+- `text_model_rejects_zero_sliding_key_value_heads`
+- `text_model_rejects_non_divisible_key_value_heads`
+- `text_model_rejects_zero_global_key_value_heads`
+- `text_model_rejects_zero_local_head_dim`
+- `text_model_rejects_zero_global_head_dim`
+- `text_model_rejects_invalid_partial_rotary_factor`
+- `text_model_rejects_empty_input_sequence`
+
+已运行：
+
+```bash
+cargo test -p candle-transformers models::gemma4::text::tests
+```
+
+分支：
+
+- `agent/bug-038-gemma4-text-zero-sliding-kv-heads`
+- `agent/bug-039-gemma4-text-kv-head-divisibility`
+- `agent/bug-040-gemma4-text-zero-global-kv-heads`
+- `agent/bug-041-gemma4-text-zero-local-head-dim`
+- `agent/bug-042-gemma4-text-zero-global-head-dim`
+- `agent/bug-043-gemma4-text-invalid-rotary-factor`
+- `agent/bug-044-gemma4-text-empty-input-sequence`
+
+## 四十四个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
