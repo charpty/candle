@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百零七个 public API 边界修复
+# Candle bug hunt 报告：一百一十六个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百零七个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百一十六个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -15,7 +15,7 @@ forward 边界；BUG-075 到 BUG-080 覆盖 Qwen3-VL 外层 forward 的 per-batc
 placeholder span 合同；BUG-081 到 BUG-086 覆盖 Qwen3-VL vision runtime `grid_thw` 合同；
 BUG-087 到 BUG-092 覆盖 PaddleOCR-VL vision 构造期配置；BUG-093 到 BUG-097 覆盖
 PaddleOCR-VL text attention 配置和空序列 forward 合同；BUG-098 到 BUG-107 覆盖 PaddleOCR-VL
-vision runtime `grid_thw` 合同。
+vision runtime `grid_thw` 合同；BUG-108 到 BUG-116 覆盖 PaddleOCR-VL text M-RoPE 运行期输入合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -133,6 +133,15 @@ vision runtime `grid_thw` 合同。
 | BUG-105 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | grid width 不能被 `spatial_merge_size` 整除时 projector 静默丢掉尾部 patch 列 | 入口校验 width 整除关系 |
 | BUG-106 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | pixel token 行数和 `grid_thw` 派生 token 数不一致时只得到间接 narrow/reshape 错误 | forward 入口校验二者 token count 一致 |
 | BUG-107 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `build_cu_seqlens` 用 `u32` 计算 `h * w`，超大 grid 在 debug 下溢出 panic | 使用 `usize` 和 checked arithmetic 计算面积与累计长度 |
+| BUG-108 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `apply_multimodal_rotary_emb` 对 `position_ids[0] != 3` 使用 `assert_eq!` panic | 返回明确 `position_ids` shape 错误 |
+| BUG-109 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | export 版 M-RoPE 同样对错误第一维 `assert_eq!` panic | export 路径复用同一 shape 校验 |
+| BUG-110 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `position_ids` batch 维不匹配时会把 q/k batch 静默广播扩大 | 要求 `position_ids` batch 精确匹配 q/k |
+| BUG-111 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `position_ids` seq_len 不匹配时只得到间接 broadcast 错误 | 要求 `position_ids` seq_len 精确匹配 q/k |
+| BUG-112 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | 单图 M-RoPE `grid_h = 0` 被接受，image token 被当成普通文本推进 | 拒绝零 grid height |
+| BUG-113 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | 单图 M-RoPE `grid_w = 0` 被接受，image token 被当成普通文本推进 | 拒绝零 grid width |
+| BUG-114 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | image token 少于 `grid_h * grid_w` 时 helper 仍返回 Ok | 要求 image token 数等于 grid 面积 |
+| BUG-115 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | image token 多于 `grid_h * grid_w` 时多余 token 被当成文本 | 同样校验 token count |
+| BUG-116 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | image token 非连续时仍被按同一图像位置编码 | 要求 image token span 连续 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2150,7 +2159,74 @@ git diff --check
 - `agent/bug-106-paddleocr-vl-grid-token-count`
 - `agent/bug-107-paddleocr-vl-grid-area-overflow`
 
-## 一百零七个案例教什么
+## BUG-108 到 BUG-116：PaddleOCR-VL text M-RoPE 输入合同
+
+受影响文件：
+
+- [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs)
+
+这一组继续看 PaddleOCR-VL text，但关注点从构造期配置转到运行期 M-RoPE 输入。M-RoPE
+有两个容易被低估的协议：
+
+- `RotaryEmbedding::apply_multimodal_rotary_emb` 的 `position_ids` 必须是 `[3, batch, seq_len]`。
+- `compute_mrope_position_ids` 里 image token span 必须和 `grid_h * grid_w` 完全一致。
+
+原实现的问题是，第一条协议用 `assert_eq!` 和 Tensor broadcast 间接处理，第二条协议只找第一个
+image token，然后继续扫描后续 token，没有证明 token 数量和连续性。
+
+修复前 9 个测试的失败形态：
+
+- `position_ids` 第一维为 2：普通 M-RoPE 路径 `assert_eq!` panic。
+- export 版 M-RoPE 第一维为 2：同样 `assert_eq!` panic。
+- `position_ids` batch 为 2、q/k batch 为 1：broadcast 把输出 batch 静默扩大。
+- `position_ids` seq_len 为 3、q/k seq_len 为 2：只得到间接 `broadcast_mul` shape 错误。
+- `grid_h = 0` 或 `grid_w = 0`：单图 helper 返回 `Ok`，image token 被当成普通文本位置推进。
+- image token 少于 grid 面积：helper 返回 `Ok`，缺失的视觉 token 没被发现。
+- image token 多于 grid 面积：多余 image token 被当成文本 token。
+- image token 非连续：两个 image token 被当成同一张图分散编码。
+
+修复策略：
+
+1. 新增 `validate_position_ids`，同时校验 q/k batch、seq_len、head_dim，以及 `position_ids` 精确 shape。
+2. 普通 M-RoPE 和 export M-RoPE 共用这个校验，删除 public 方法中的 `assert_eq!`。
+3. 新增 `validate_image_grid`，拒绝零 `grid_h/grid_w`，并用 checked arithmetic 计算 grid token 数。
+4. `compute_mrope_position_ids` 对每个 batch 收集 image token 位置，要求数量等于 grid 面积且位置连续。
+5. 额外补一个正向测试，确认连续 image token 的位置编码仍保持原语义。
+
+新增测试：
+
+- `rotary_embedding_rejects_position_ids_with_wrong_first_dim`
+- `rotary_embedding_export_rejects_position_ids_with_wrong_first_dim`
+- `rotary_embedding_rejects_position_ids_batch_mismatch`
+- `rotary_embedding_rejects_position_ids_seq_len_mismatch`
+- `compute_mrope_position_ids_rejects_zero_grid_height`
+- `compute_mrope_position_ids_rejects_zero_grid_width`
+- `compute_mrope_position_ids_rejects_too_few_image_tokens`
+- `compute_mrope_position_ids_rejects_too_many_image_tokens`
+- `compute_mrope_position_ids_rejects_non_contiguous_image_tokens`
+- `compute_mrope_position_ids_accepts_contiguous_image_tokens`
+
+修复后验证：
+
+```bash
+cargo test -p candle-transformers models::paddleocr_vl::text::tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-108-paddleocr-vl-position-ids-first-dim`
+- `agent/bug-109-paddleocr-vl-position-ids-export-first-dim`
+- `agent/bug-110-paddleocr-vl-position-ids-batch-mismatch`
+- `agent/bug-111-paddleocr-vl-position-ids-seq-mismatch`
+- `agent/bug-112-paddleocr-vl-mrope-zero-grid-height`
+- `agent/bug-113-paddleocr-vl-mrope-zero-grid-width`
+- `agent/bug-114-paddleocr-vl-mrope-too-few-image-tokens`
+- `agent/bug-115-paddleocr-vl-mrope-too-many-image-tokens`
+- `agent/bug-116-paddleocr-vl-mrope-non-contiguous-image-tokens`
+
+## 一百一十六个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
