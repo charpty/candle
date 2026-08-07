@@ -12,6 +12,61 @@ use super::config::VisionConfig;
 /// Default maximum number of cached position embeddings.
 const DEFAULT_POS_EMBED_CACHE_SIZE: usize = 16;
 
+fn checked_merged_hidden_size(cfg: &VisionConfig) -> Result<usize> {
+    if cfg.spatial_merge_size == 0 {
+        candle::bail!("spatial_merge_size must be greater than zero");
+    }
+    let Some(spatial_merge_unit) = cfg.spatial_merge_size.checked_mul(cfg.spatial_merge_size)
+    else {
+        candle::bail!(
+            "spatial_merge_size ({}) squared overflows usize",
+            cfg.spatial_merge_size
+        );
+    };
+    let Some(merged_hidden_size) = cfg.hidden_size.checked_mul(spatial_merge_unit) else {
+        candle::bail!(
+            "hidden_size ({}) times spatial merge unit ({spatial_merge_unit}) overflows usize",
+            cfg.hidden_size
+        );
+    };
+    Ok(merged_hidden_size)
+}
+
+fn validate_vision_config(cfg: &VisionConfig) -> Result<()> {
+    if cfg.hidden_size == 0 {
+        candle::bail!("hidden_size must be greater than zero");
+    }
+    if cfg.num_attention_heads == 0 {
+        candle::bail!("num_attention_heads must be greater than zero");
+    }
+    if cfg.hidden_size % cfg.num_attention_heads != 0 {
+        candle::bail!(
+            "hidden_size ({}) must be divisible by num_attention_heads ({})",
+            cfg.hidden_size,
+            cfg.num_attention_heads
+        );
+    }
+    let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+    if head_dim == 0 || head_dim % 4 != 0 {
+        candle::bail!("head_dim ({head_dim}) must be a non-zero multiple of 4");
+    }
+    if cfg.patch_size == 0 {
+        candle::bail!("patch_size must be greater than zero");
+    }
+    if cfg.image_size == 0 {
+        candle::bail!("image_size must be greater than zero");
+    }
+    if cfg.image_size % cfg.patch_size != 0 {
+        candle::bail!(
+            "image_size ({}) must be divisible by patch_size ({})",
+            cfg.image_size,
+            cfg.patch_size
+        );
+    }
+    checked_merged_hidden_size(cfg)?;
+    Ok(())
+}
+
 /// LFU (Least Frequently Used) cache for interpolated position embeddings.
 ///
 /// Caches interpolated position embeddings keyed by (height, width) grid dimensions.
@@ -680,7 +735,7 @@ pub struct Projector {
 
 impl Projector {
     pub fn new(cfg: &VisionConfig, text_hidden_size: usize, vb: VarBuilder) -> Result<Self> {
-        let merged_hidden_size = cfg.hidden_size * cfg.spatial_merge_size.pow(2);
+        let merged_hidden_size = checked_merged_hidden_size(cfg)?;
         let norm_cfg = LayerNormConfig {
             eps: 1e-5,
             ..Default::default()
@@ -867,6 +922,7 @@ impl VisionModel {
         vb: VarBuilder,
         projector_vb: VarBuilder,
     ) -> Result<Self> {
+        validate_vision_config(vision_cfg)?;
         // Embeddings: embeddings.patch_embedding, embeddings.position_embedding
         let embeddings = PatchEmbedding::new(vision_cfg, vb.pp("embeddings"))?;
 
@@ -1218,5 +1274,91 @@ impl VisionModel {
         exports.insert("projector_output".to_string(), output.to_dtype(DType::F32)?);
 
         Ok((output.to_dtype(dtype)?, exports))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::Activation;
+
+    fn tiny_vision_config() -> VisionConfig {
+        VisionConfig {
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 0,
+            num_attention_heads: 2,
+            num_channels: 3,
+            image_size: 4,
+            patch_size: 2,
+            hidden_act: Activation::Gelu,
+            layer_norm_eps: 1e-6,
+            attention_dropout: 0.0,
+            spatial_merge_size: 2,
+        }
+    }
+
+    fn new_model(cfg: &VisionConfig) -> Result<VisionModel> {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        VisionModel::new(cfg, 8, vb.pp("vision"), vb.pp("projector"))
+    }
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vision_model_rejects_zero_attention_heads() {
+        let mut cfg = tiny_vision_config();
+        cfg.num_attention_heads = 0;
+        assert_err_contains(new_model(&cfg), "num_attention_heads");
+    }
+
+    #[test]
+    fn vision_model_rejects_hidden_size_not_divisible_by_heads() {
+        let mut cfg = tiny_vision_config();
+        cfg.hidden_size = 10;
+        cfg.num_attention_heads = 4;
+        assert_err_contains(new_model(&cfg), "divisible");
+    }
+
+    #[test]
+    fn vision_model_rejects_invalid_rotary_head_dim() {
+        let mut cfg = tiny_vision_config();
+        cfg.hidden_size = 6;
+        cfg.num_attention_heads = 2;
+        assert_err_contains(new_model(&cfg), "head_dim");
+    }
+
+    #[test]
+    fn vision_model_rejects_zero_patch_size() {
+        let mut cfg = tiny_vision_config();
+        cfg.patch_size = 0;
+        assert_err_contains(new_model(&cfg), "patch_size");
+    }
+
+    #[test]
+    fn vision_model_rejects_image_size_not_divisible_by_patch_size() {
+        let mut cfg = tiny_vision_config();
+        cfg.image_size = 5;
+        cfg.patch_size = 2;
+        assert_err_contains(new_model(&cfg), "image_size");
+    }
+
+    #[test]
+    fn vision_model_rejects_zero_spatial_merge_size() {
+        let mut cfg = tiny_vision_config();
+        cfg.spatial_merge_size = 0;
+        assert_err_contains(new_model(&cfg), "spatial_merge_size");
     }
 }
