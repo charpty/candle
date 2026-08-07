@@ -91,6 +91,26 @@ impl Mlp {
     }
 }
 
+fn validate_attention_config(cfg: &TextConfig) -> Result<()> {
+    if cfg.num_attention_heads == 0 {
+        candle::bail!("num_attention_heads must be greater than zero");
+    }
+    if cfg.num_key_value_heads == 0 {
+        candle::bail!("num_key_value_heads must be greater than zero");
+    }
+    if cfg.num_attention_heads % cfg.num_key_value_heads != 0 {
+        candle::bail!(
+            "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads
+        );
+    }
+    if cfg.head_dim == 0 {
+        candle::bail!("head_dim must be greater than zero");
+    }
+    Ok(())
+}
+
 struct Attention {
     q_proj: Linear,
     k_proj: Linear,
@@ -109,6 +129,7 @@ struct Attention {
 
 impl Attention {
     fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+        validate_attention_config(cfg)?;
         let hidden_sz = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
@@ -260,6 +281,7 @@ pub struct Qwen3VLTextModel {
 
 impl Qwen3VLTextModel {
     pub fn new(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+        validate_attention_config(cfg)?;
         let vb_m = vb.pp("model").pp("language_model");
 
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
@@ -309,16 +331,16 @@ impl Qwen3VLTextModel {
         deepstack_visual_embeds: Option<&[Tensor]>,
     ) -> Result<Tensor> {
         let (_, seq_len, _) = xs.dims3()?;
+        if seq_len == 0 {
+            candle::bail!("Qwen3-VL text input sequence length must be greater than zero");
+        }
 
         for (i, layer) in self.layers.iter().enumerate() {
-            xs = layer.forward(
-                &xs,
-                attention_mask
-                    .as_ref()
-                    .map(|m| m.to_device(xs.device()).unwrap())
-                    .as_ref(),
-                seqlen_offsets,
-            )?;
+            let attention_mask = match attention_mask {
+                None => None,
+                Some(mask) => Some(mask.to_device(xs.device())?),
+            };
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offsets)?;
 
             // Integrate DeepStack visual features when provided.
             if let (Some(visual_pos_masks), Some(deepstack)) =
@@ -391,5 +413,91 @@ impl Qwen3VLTextModel {
 
         hidden_flat = hidden_flat.scatter_add(&linear_index, &visual_embeds, 0)?;
         hidden_flat.reshape((batch, seq, hidden))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_text_config() -> TextConfig {
+        TextConfig {
+            head_dim: 4,
+            vocab_size: 8,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            hidden_act: Activation::Gelu,
+            max_position_embeddings: 8,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: true,
+            rope_theta: 10000.0,
+            sliding_window: None,
+        }
+    }
+
+    fn new_model(cfg: &TextConfig) -> Result<Qwen3VLTextModel> {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        Qwen3VLTextModel::new(cfg, vb)
+    }
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_model_rejects_zero_attention_heads() {
+        let mut cfg = tiny_text_config();
+        cfg.num_attention_heads = 0;
+        assert_err_contains(new_model(&cfg), "num_attention_heads");
+    }
+
+    #[test]
+    fn text_model_rejects_zero_key_value_heads() {
+        let mut cfg = tiny_text_config();
+        cfg.num_key_value_heads = 0;
+        assert_err_contains(new_model(&cfg), "num_key_value_heads");
+    }
+
+    #[test]
+    fn text_model_rejects_non_divisible_key_value_heads() {
+        let mut cfg = tiny_text_config();
+        cfg.num_attention_heads = 3;
+        cfg.num_key_value_heads = 2;
+        assert_err_contains(new_model(&cfg), "must be divisible");
+    }
+
+    #[test]
+    fn text_model_rejects_zero_head_dim() {
+        let mut cfg = tiny_text_config();
+        cfg.head_dim = 0;
+        assert_err_contains(new_model(&cfg), "head_dim");
+    }
+
+    #[test]
+    fn text_model_rejects_empty_input_sequence() -> Result<()> {
+        let cfg = tiny_text_config();
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        let model = Qwen3VLTextModel::new(&cfg, vb)?;
+        let xs = Tensor::zeros((1, 0, cfg.hidden_size), DType::F32, &device)?;
+
+        assert_err_contains(
+            model.forward_embeds(xs, None, &[0], None, None),
+            "sequence length",
+        );
+        Ok(())
     }
 }
