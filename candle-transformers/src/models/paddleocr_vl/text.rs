@@ -515,6 +515,37 @@ pub struct VideoGrid {
     pub grid_w: usize,
 }
 
+fn validate_video_grid(
+    video_grid: &VideoGrid,
+    second_per_grid_t: f32,
+    tokens_per_second: usize,
+) -> Result<(usize, usize)> {
+    if video_grid.grid_t == 0 {
+        candle::bail!("grid_t must be greater than zero");
+    }
+    if video_grid.grid_h == 0 {
+        candle::bail!("grid_h must be greater than zero");
+    }
+    if video_grid.grid_w == 0 {
+        candle::bail!("grid_w must be greater than zero");
+    }
+    if !second_per_grid_t.is_finite() || second_per_grid_t <= 0.0 {
+        candle::bail!("second_per_grid_t must be finite and greater than zero");
+    }
+    if tokens_per_second == 0 {
+        candle::bail!("tokens_per_second must be greater than zero");
+    }
+
+    let Some(spatial_tokens) = video_grid.grid_h.checked_mul(video_grid.grid_w) else {
+        candle::bail!("video spatial grid token count overflows usize");
+    };
+    let Some(num_vision_tokens) = video_grid.grid_t.checked_mul(spatial_tokens) else {
+        candle::bail!("video grid token count overflows usize");
+    };
+
+    Ok((spatial_tokens, num_vision_tokens))
+}
+
 /// Compute 3D M-RoPE position IDs for video input.
 ///
 /// Unlike multi-image (where t=0 for all images), video uses sequential
@@ -552,7 +583,8 @@ pub fn compute_mrope_position_ids_video(
     let grid_t = video_grid.grid_t;
     let grid_h = video_grid.grid_h;
     let grid_w = video_grid.grid_w;
-    let num_vision_tokens = grid_t * grid_h * grid_w;
+    let (spatial_tokens, num_vision_tokens) =
+        validate_video_grid(video_grid, second_per_grid_t, tokens_per_second)?;
 
     // Create position IDs for all 3 dimensions
     let mut pos_t = vec![0i64; batch * seq_len];
@@ -561,88 +593,65 @@ pub fn compute_mrope_position_ids_video(
 
     for b in 0..batch {
         let batch_start = b * seq_len;
-
-        // Find the video token range
-        let mut video_start = None;
-        let mut video_end = None;
-        let mut in_video = false;
-
-        for s in 0..seq_len {
-            let token_id = input_ids_vec[batch_start + s];
-            if token_id == video_token_id {
-                if !in_video {
-                    in_video = true;
-                    video_start = Some(s);
-                }
-            } else if in_video {
-                video_end = Some(s);
-                break;
-            }
+        let video_positions: Vec<usize> = (0..seq_len)
+            .filter(|&s| input_ids_vec[batch_start + s] == video_token_id)
+            .collect();
+        if video_positions.len() != num_vision_tokens {
+            candle::bail!(
+                "Video token count ({}) must match grid {grid_t}x{grid_h}x{grid_w} = {num_vision_tokens}",
+                video_positions.len()
+            );
         }
-        // Handle case where video tokens extend to end of sequence
-        if in_video && video_end.is_none() {
-            video_end = Some(seq_len);
-        }
-
-        // Verify video token count matches grid
-        if let (Some(start), Some(end)) = (video_start, video_end) {
-            let actual_tokens = end - start;
-            if actual_tokens != num_vision_tokens {
-                return Err(candle::Error::Msg(format!(
-                    "Video has {} tokens but grid {}x{}x{} = {} expected",
-                    actual_tokens, grid_t, grid_h, grid_w, num_vision_tokens
-                )));
-            }
+        if video_positions.windows(2).any(|w| w[1] != w[0] + 1) {
+            candle::bail!("Video tokens must be contiguous");
         }
 
         // Compute positions
         let mut current_pos = 0i64;
-        let video_range = video_start.zip(video_end);
+        let video_range = (video_positions[0], video_positions[0] + num_vision_tokens);
 
         for s in 0..seq_len {
             let idx = batch_start + s;
 
             // Check if we're at the start of the video range
-            if let Some((v_start, v_end)) = video_range {
-                if s == v_start {
-                    // Process entire video range with 3D positions
-                    let offset = current_pos;
+            let (v_start, v_end) = video_range;
+            if s == v_start {
+                // Process entire video range with 3D positions
+                let offset = current_pos;
 
-                    for vision_idx in 0..num_vision_tokens {
-                        let token_s = v_start + vision_idx;
-                        let token_idx = batch_start + token_s;
+                for vision_idx in 0..num_vision_tokens {
+                    let token_s = v_start + vision_idx;
+                    let token_idx = batch_start + token_s;
 
-                        // 3D position: t uses temporal scaling for proper frame spacing
-                        // Formula: t_pos = frame_index * second_per_grid_t * tokens_per_second
-                        // This matches HuggingFace Qwen2-VL processor behavior
-                        let frame_index = vision_idx / (grid_h * grid_w);
-                        let t_pos = (frame_index as f32
-                            * second_per_grid_t
-                            * tokens_per_second as f32) as i64;
-                        let spatial_idx = vision_idx % (grid_h * grid_w);
-                        let h_pos = (spatial_idx / grid_w) as i64;
-                        let w_pos = (spatial_idx % grid_w) as i64;
+                    // 3D position: t uses temporal scaling for proper frame spacing
+                    // Formula: t_pos = frame_index * second_per_grid_t * tokens_per_second
+                    // This matches HuggingFace Qwen2-VL processor behavior
+                    let frame_index = vision_idx / spatial_tokens;
+                    let t_pos =
+                        (frame_index as f32 * second_per_grid_t * tokens_per_second as f32) as i64;
+                    let spatial_idx = vision_idx % spatial_tokens;
+                    let h_pos = (spatial_idx / grid_w) as i64;
+                    let w_pos = (spatial_idx % grid_w) as i64;
 
-                        pos_t[token_idx] = t_pos + offset;
-                        pos_h[token_idx] = h_pos + offset;
-                        pos_w[token_idx] = w_pos + offset;
-                    }
-
-                    // Update current_pos to max position in video + 1
-                    // max_t also needs temporal scaling to match the scaled positions
-                    let max_t =
-                        ((grid_t - 1) as f32 * second_per_grid_t * tokens_per_second as f32) as i64;
-                    let max_h = (grid_h - 1) as i64;
-                    let max_w = (grid_w - 1) as i64;
-                    current_pos = offset + max_t.max(max_h).max(max_w) + 1;
-
-                    continue;
+                    pos_t[token_idx] = t_pos + offset;
+                    pos_h[token_idx] = h_pos + offset;
+                    pos_w[token_idx] = w_pos + offset;
                 }
 
-                // Skip if we're inside the video range (already processed)
-                if s > v_start && s < v_end {
-                    continue;
-                }
+                // Update current_pos to max position in video + 1
+                // max_t also needs temporal scaling to match the scaled positions
+                let max_t =
+                    ((grid_t - 1) as f32 * second_per_grid_t * tokens_per_second as f32) as i64;
+                let max_h = (grid_h - 1) as i64;
+                let max_w = (grid_w - 1) as i64;
+                current_pos = offset + max_t.max(max_h).max(max_w) + 1;
+
+                continue;
+            }
+
+            // Skip if we're inside the video range (already processed)
+            if s > v_start && s < v_end {
+                continue;
             }
 
             // Text token: all dimensions same
@@ -1256,5 +1265,185 @@ impl TextModel {
         tensors.insert("logits".to_string(), logits.clone());
 
         Ok((logits, tensors))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    fn video_grid(grid_t: usize, grid_h: usize, grid_w: usize) -> VideoGrid {
+        VideoGrid {
+            grid_t,
+            grid_h,
+            grid_w,
+        }
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_video_rejects_zero_grid_t() -> Result<()> {
+        let input_ids = Tensor::new(&[[1u32, 2]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids_video(
+                &input_ids,
+                99,
+                &video_grid(0, 1, 1),
+                1.0,
+                2,
+                &Device::Cpu,
+            ),
+            "grid_t",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_video_rejects_zero_grid_h() -> Result<()> {
+        let input_ids = Tensor::new(&[[1u32, 2]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids_video(
+                &input_ids,
+                99,
+                &video_grid(1, 0, 1),
+                1.0,
+                2,
+                &Device::Cpu,
+            ),
+            "grid_h",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_video_rejects_zero_grid_w() -> Result<()> {
+        let input_ids = Tensor::new(&[[1u32, 2]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids_video(
+                &input_ids,
+                99,
+                &video_grid(1, 1, 0),
+                1.0,
+                2,
+                &Device::Cpu,
+            ),
+            "grid_w",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_video_rejects_zero_tokens_per_second() -> Result<()> {
+        let input_ids = Tensor::new(&[[99u32]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids_video(
+                &input_ids,
+                99,
+                &video_grid(1, 1, 1),
+                1.0,
+                0,
+                &Device::Cpu,
+            ),
+            "tokens_per_second",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_video_rejects_zero_seconds_per_grid_t() -> Result<()> {
+        let input_ids = Tensor::new(&[[99u32]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids_video(
+                &input_ids,
+                99,
+                &video_grid(1, 1, 1),
+                0.0,
+                2,
+                &Device::Cpu,
+            ),
+            "second_per_grid_t",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_video_rejects_negative_seconds_per_grid_t() -> Result<()> {
+        let input_ids = Tensor::new(&[[99u32]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids_video(
+                &input_ids,
+                99,
+                &video_grid(1, 1, 1),
+                -1.0,
+                2,
+                &Device::Cpu,
+            ),
+            "second_per_grid_t",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_video_rejects_non_finite_seconds_per_grid_t() -> Result<()> {
+        let input_ids = Tensor::new(&[[99u32]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids_video(
+                &input_ids,
+                99,
+                &video_grid(1, 1, 1),
+                f32::NAN,
+                2,
+                &Device::Cpu,
+            ),
+            "second_per_grid_t",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_video_rejects_extra_non_contiguous_video_tokens() -> Result<()> {
+        let input_ids = Tensor::new(&[[99u32, 1, 99]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids_video(
+                &input_ids,
+                99,
+                &video_grid(1, 1, 1),
+                1.0,
+                2,
+                &Device::Cpu,
+            ),
+            "Video token count",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_video_accepts_contiguous_video_tokens() -> Result<()> {
+        let input_ids = Tensor::new(&[[1u32, 99, 99, 2]], &Device::Cpu)?;
+        let position_ids = compute_mrope_position_ids_video(
+            &input_ids,
+            99,
+            &video_grid(2, 1, 1),
+            1.0,
+            2,
+            &Device::Cpu,
+        )?;
+        assert_eq!(position_ids.dims(), &[3, 1, 4]);
+        assert_eq!(position_ids.i(0)?.to_vec2::<i64>()?, vec![vec![0, 1, 3, 4]]);
+        assert_eq!(position_ids.i(1)?.to_vec2::<i64>()?, vec![vec![0, 1, 1, 4]]);
+        assert_eq!(position_ids.i(2)?.to_vec2::<i64>()?, vec![vec![0, 1, 1, 4]]);
+        Ok(())
     }
 }
