@@ -77,6 +77,12 @@ impl PatchEmbeddings {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let image_size = cfg.image_size;
         let patch_size = cfg.patch_size;
+        if patch_size == 0 {
+            candle::bail!("patch_size must be greater than zero")
+        }
+        if image_size % patch_size != 0 {
+            candle::bail!("image_size {image_size} must be divisible by patch_size {patch_size}")
+        }
         let num_patches = (image_size / patch_size) * (image_size / patch_size);
         let conv_cfg = candle_nn::Conv2dConfig {
             stride: patch_size,
@@ -188,6 +194,16 @@ struct SelfAttention {
 
 impl SelfAttention {
     fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        if cfg.num_attention_heads == 0 {
+            candle::bail!("num_attention_heads must be greater than zero")
+        }
+        if cfg.hidden_size % cfg.num_attention_heads != 0 {
+            candle::bail!(
+                "hidden_size {} must be divisible by num_attention_heads {}",
+                cfg.hidden_size,
+                cfg.num_attention_heads
+            )
+        }
         let attention_head_size = cfg.hidden_size / cfg.num_attention_heads;
         let num_attention_heads = cfg.num_attention_heads;
         let all_head_size = num_attention_heads * attention_head_size;
@@ -412,5 +428,84 @@ impl Model {
             .i((.., 0, ..))?
             .apply(&self.layernorm)?
             .apply(&self.classifier)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::{DType, Device};
+
+    fn tiny_config() -> Config {
+        Config {
+            hidden_size: 4,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            intermediate_size: 8,
+            hidden_act: candle_nn::Activation::Gelu,
+            layer_norm_eps: 1e-12,
+            image_size: 4,
+            patch_size: 2,
+            num_channels: 3,
+            qkv_bias: true,
+        }
+    }
+
+    #[test]
+    fn patch_embeddings_rejects_zero_patch_size() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.patch_size = 0;
+
+        let err = PatchEmbeddings::new(&cfg, VarBuilder::zeros(DType::F32, &device))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("patch_size"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn patch_embeddings_rejects_non_divisible_image_size() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.image_size = 5;
+        cfg.patch_size = 2;
+
+        let err = PatchEmbeddings::new(&cfg, VarBuilder::zeros(DType::F32, &device))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("divisible"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn self_attention_rejects_zero_attention_heads() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.num_attention_heads = 0;
+
+        let err = SelfAttention::new(&cfg, VarBuilder::zeros(DType::F32, &device))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("num_attention_heads"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn self_attention_rejects_hidden_size_not_divisible_by_heads() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.hidden_size = 5;
+        cfg.num_attention_heads = 2;
+
+        let err = SelfAttention::new(&cfg, VarBuilder::zeros(DType::F32, &device))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("hidden_size"));
+
+        Ok(())
     }
 }
