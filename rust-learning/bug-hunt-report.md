@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：八十六个 public API 边界修复
+# Candle bug hunt 报告：九十二个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复八十六个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复九十二个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -12,7 +12,8 @@ Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 mul
 继续覆盖 Gemma4 multimodal/vision 的运行期数量和 pooling 边界；BUG-063 到 BUG-069 覆盖
 Qwen3-VL vision 构造期配置；BUG-070 到 BUG-074 覆盖 Qwen3-VL text attention 配置和空序列
 forward 边界；BUG-075 到 BUG-080 覆盖 Qwen3-VL 外层 forward 的 per-batch 元数据和 image/video
-placeholder span 合同；BUG-081 到 BUG-086 覆盖 Qwen3-VL vision runtime `grid_thw` 合同。
+placeholder span 合同；BUG-081 到 BUG-086 覆盖 Qwen3-VL vision runtime `grid_thw` 合同；
+BUG-087 到 BUG-092 覆盖 PaddleOCR-VL vision 构造期配置。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -109,6 +110,12 @@ placeholder span 合同；BUG-081 到 BUG-086 覆盖 Qwen3-VL vision runtime `gr
 | BUG-084 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | grid width 不能被 `spatial_merge_size` 整除时延迟成 reshape 错误 | 插值/reshape 前校验 width 整除关系 |
 | BUG-085 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | pixel token 行数和 `grid_thw` 派生 token 数不一致时只得到 add shape mismatch | forward 入口校验二者 token count 一致 |
 | BUG-086 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `h * w` 用 `u32` 乘法，超大 grid 在 debug 下溢出 panic | 使用 checked arithmetic 并返回 `Err` |
+| BUG-087 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | PaddleOCR-VL vision `num_attention_heads = 0` 在 `head_dim()` 中除零 panic | 构造阶段拒绝零 attention heads |
+| BUG-088 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `hidden_size % num_attention_heads != 0` 时 head dim 静默截断 | 要求 hidden size 可被 heads 整除 |
+| BUG-089 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | 2D RoPE head dim 非 4 的倍数时 cos/sin 维度和 Q/K head dim 不匹配 | 要求 vision head_dim 是 4 的非零倍数 |
+| BUG-090 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `patch_size = 0` 在 position embedding base grid 计算时除零 | 构造阶段拒绝零 patch |
+| BUG-091 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `image_size % patch_size != 0` 时 base position grid 静默截断 | 要求 image size 可被 patch size 整除 |
+| BUG-092 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `spatial_merge_size = 0` 被 Projector 构造接受，forward 后续除零 | Projector/VisionModel 构造阶段拒绝零 spatial merge |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -1938,7 +1945,65 @@ git diff --check
 - `agent/bug-085-qwen3-vl-grid-token-count`
 - `agent/bug-086-qwen3-vl-grid-area-overflow`
 
-## 八十六个案例教什么
+## BUG-087 到 BUG-092：PaddleOCR-VL vision 构造期配置
+
+受影响文件：
+
+- [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs)
+
+这一组是从 Qwen3-VL 迁移出来的同类审计：PaddleOCR-VL vision 也是 NaViT 风格视觉 encoder，
+同样有 patch embedding、2D RoPE、spatial merge projector。它的构造路径里存在这些派生值：
+
+```rust
+let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+let base_grid_size = cfg.image_size / cfg.patch_size;
+let merged_hidden_size = cfg.hidden_size * cfg.spatial_merge_size.pow(2);
+VisionRotaryEmbedding::new(head_dim / 2, device)?;
+```
+
+修复前 6 个测试的失败形态：
+
+- `num_attention_heads = 0`：`VisionConfig::head_dim()` 直接除零 panic。
+- `hidden_size = 10, num_attention_heads = 4`：构造函数返回 `Ok`，head dim 被静默截断。
+- `hidden_size = 6, num_attention_heads = 2`：构造函数返回 `Ok`，但 2D RoPE 的 cos/sin 维度后续无法和 3 维 head 对齐。
+- `patch_size = 0`：`image_size / patch_size` 直接除零 panic。
+- `image_size = 5, patch_size = 2`：构造函数返回 `Ok`，base position grid 从 2.5 静默截断成 2。
+- `spatial_merge_size = 0`：Projector 构造函数返回 `Ok`，但 forward 中 `h / m`、`w / m` 会除零。
+
+修复策略：
+
+1. 新增 `validate_vision_config`，在 `VisionModel::new` 最前面拒绝非法 heads、patch/image size 和 RoPE head dim。
+2. 新增 `checked_merged_hidden_size`，用 checked arithmetic 计算 `hidden_size * spatial_merge_size^2`。
+3. `Projector::new` 也使用 `checked_merged_hidden_size`，避免未来直接构造 projector 时绕过 `VisionModel::new`。
+4. 明确要求 PaddleOCR-VL vision head dim 是 4 的非零倍数；这是 2D RoPE 拼接回 Q/K head dim 的必要 shape 合同。
+
+新增测试：
+
+- `vision_model_rejects_zero_attention_heads`
+- `vision_model_rejects_hidden_size_not_divisible_by_heads`
+- `vision_model_rejects_invalid_rotary_head_dim`
+- `vision_model_rejects_zero_patch_size`
+- `vision_model_rejects_image_size_not_divisible_by_patch_size`
+- `vision_model_rejects_zero_spatial_merge_size`
+
+修复后验证：
+
+```bash
+cargo test -p candle-transformers models::paddleocr_vl::vision::tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-087-paddleocr-vl-zero-vision-heads`
+- `agent/bug-088-paddleocr-vl-vision-head-divisibility`
+- `agent/bug-089-paddleocr-vl-vision-rope-head-dim`
+- `agent/bug-090-paddleocr-vl-zero-patch-size`
+- `agent/bug-091-paddleocr-vl-image-patch-divisibility`
+- `agent/bug-092-paddleocr-vl-zero-spatial-merge`
+
+## 九十二个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
