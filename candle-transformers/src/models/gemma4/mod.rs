@@ -185,14 +185,14 @@ fn broadcast_embed_to_mask(embeds: &Tensor, mask: &Tensor) -> Result<Tensor> {
     let zeros = Tensor::zeros((b_sz, seq_len, hidden), embeds.dtype(), embeds.device())?;
     let mask_values = mask.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
     let token_count = mask_values.iter().filter(|&&v| v != 0.0).count();
-    if token_count == 0 {
-        return Ok(zeros);
-    }
     let embed_len = embeds.dim(0)?;
     if embed_len != token_count {
         candle::bail!(
             "multimodal embedding count {embed_len} does not match mask token count {token_count}"
         )
+    }
+    if token_count == 0 {
+        return Ok(zeros);
     }
 
     let mut next_embed = 0u32;
@@ -262,6 +262,18 @@ mod tests {
         let device = candle::Device::Cpu;
         let embeds = Tensor::from_vec(vec![1f32, 2.], (1, 2), &device)?;
         let mask = Tensor::from_vec(vec![1f32, 0., 1.], (1, 3), &device)?;
+        let err = broadcast_embed_to_mask(&embeds, &mask)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match mask token count"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn broadcast_embed_to_mask_rejects_embeddings_without_mask_tokens() -> Result<()> {
+        let device = candle::Device::Cpu;
+        let embeds = Tensor::from_vec(vec![1f32, 2.], (1, 2), &device)?;
+        let mask = Tensor::zeros((1, 3), DType::F32, &device)?;
         let err = broadcast_embed_to_mask(&embeds, &mask)
             .unwrap_err()
             .to_string();
