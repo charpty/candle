@@ -57,6 +57,9 @@ impl Cache {
 
     pub fn append(&mut self, src: &Tensor) -> Result<()> {
         let seq_len = src.dim(self.dim)?;
+        if self.max_seq_len == 0 {
+            candle::bail!("cache max_seq_len must be greater than zero")
+        }
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
         // self.all_data.get_or_insert_with.
         if self.all_data.is_none() {
@@ -117,10 +120,12 @@ impl KvCache {
     }
 
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        self.k.append(k)?;
-        self.v.append(v)?;
-        let out_k = self.k.current_data()?;
-        let out_v = self.v.current_data()?;
+        let mut next_k = self.k.clone();
+        let mut next_v = self.v.clone();
+        next_k.append(k)?;
+        next_v.append(v)?;
+        let out_k = next_k.current_data()?;
+        let out_v = next_v.current_data()?;
         let k = match out_k {
             None => {
                 let mut shape = k.dims().to_vec();
@@ -137,6 +142,8 @@ impl KvCache {
             }
             Some(v) => v,
         };
+        self.k = next_k;
+        self.v = next_v;
         Ok((k, v))
     }
 
@@ -216,6 +223,9 @@ impl RotatingCache {
 
     pub fn append(&mut self, src: &Tensor) -> Result<Tensor> {
         let seq_len = src.dim(self.dim)?;
+        if self.max_seq_len == 0 {
+            candle::bail!("rotating cache max_seq_len must be greater than zero")
+        }
         // This doesn't seem very idiomatic but because the creation can fail, it's tricky to use
         // self.all_data.get_or_insert_with.
         if self.all_data.is_none() {
@@ -297,6 +307,9 @@ impl RotatingCache {
     /// Returns the positions corresponding to all the elements that will be returned
     /// *after* adding `seq_len` to the cache.
     pub fn positions(&self, seq_len: usize) -> Vec<usize> {
+        if self.max_seq_len == 0 {
+            return (self.current_seq_len..self.current_seq_len + seq_len).collect();
+        }
         if seq_len <= self.max_seq_len {
             let upd_offset = (self.offset + seq_len) % self.max_seq_len;
             let cache_out_len = (self.current_seq_len + seq_len).min(self.max_seq_len);
@@ -317,6 +330,9 @@ impl RotatingCache {
 
     /// Returns the attn_mask to be applied *after* adding `seq_len` to the cache.
     pub fn attn_mask(&self, seq_len: usize, device: &Device) -> Result<Option<Tensor>> {
+        if self.max_seq_len == 0 && seq_len != 1 {
+            candle::bail!("rotating cache max_seq_len must be greater than zero")
+        }
         let mask = if seq_len == 1 {
             None
         } else {
@@ -370,8 +386,12 @@ impl RotatingKvCache {
     }
 
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
-        let out_k = self.k.append(k)?;
-        let out_v = self.v.append(v)?;
+        let mut next_k = self.k.clone();
+        let mut next_v = self.v.clone();
+        let out_k = next_k.append(k)?;
+        let out_v = next_v.append(v)?;
+        self.k = next_k;
+        self.v = next_v;
         Ok((out_k, out_v))
     }
 
@@ -505,6 +525,13 @@ impl ScatteredCacheBuilder {
         seq_len: usize,
         batch_mask: &[bool],
     ) -> Result<IndicesAndMask> {
+        if batch_mask.len() != self.batch_size() {
+            candle::bail!(
+                "batch_mask length mismatch, got {}, expected {}",
+                batch_mask.len(),
+                self.batch_size()
+            )
+        }
         // mask shape is (b, h, t, k)
         let context = self.context;
         if self.context <= seq_len {
@@ -590,6 +617,13 @@ impl ScatteredCacheBuilder {
         seq_len: usize,
         batch_mask: &[bool],
     ) -> Result<IndicesAndMask> {
+        if batch_mask.len() != self.batch_size() {
+            candle::bail!(
+                "batch_mask length mismatch, got {}, expected {}",
+                batch_mask.len(),
+                self.batch_size()
+            )
+        }
         let mask = self.get_mask_abs(seq_len, seq_len)?;
         let mut cache_indices = Vec::with_capacity(self.batch_size());
         for (batch_i, &batch_mask) in batch_mask.iter().enumerate() {
@@ -727,15 +761,18 @@ impl ConcatKvCache {
         let k = k.contiguous()?.detach();
         let v = v.contiguous()?.detach();
 
-        self.k = Some(match &self.k {
+        let next_k = match &self.k {
             None => k,
             Some(k_cache) => Tensor::cat(&[k_cache, &k], self.dim)?.detach(),
-        });
+        };
 
-        self.v = Some(match &self.v {
+        let next_v = match &self.v {
             None => v,
             Some(v_cache) => Tensor::cat(&[v_cache, &v], self.dim)?.detach(),
-        });
+        };
+
+        self.k = Some(next_k);
+        self.v = Some(next_v);
 
         Ok((
             self.k.as_ref().unwrap().clone(),

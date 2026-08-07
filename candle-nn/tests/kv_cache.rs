@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use candle::{Device, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 
 #[test]
 fn kv_cache() -> Result<()> {
@@ -28,6 +28,48 @@ fn kv_cache() -> Result<()> {
         assert_eq!(cache.current_seq_len(), 8);
         cache.reset();
     }
+    Ok(())
+}
+
+#[test]
+fn cache_rejects_zero_max_seq_len_cpu() -> Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<(String, usize, bool)> {
+            let mut cache = candle_nn::kv_cache::Cache::new(0, 0);
+            let t = Tensor::new(&[1f32], &Device::Cpu)?;
+            let err = cache.append(&t).unwrap_err().to_string();
+            Ok((
+                err,
+                cache.current_seq_len(),
+                cache.current_data()?.is_none(),
+            ))
+        })();
+        tx.send(result).ok();
+    });
+
+    let (err, current_seq_len, is_empty) = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("zero-capacity cache append should return instead of hanging")?;
+    assert!(err.contains("max_seq_len"));
+    assert_eq!(current_seq_len, 0);
+    assert!(is_empty);
+
+    Ok(())
+}
+
+#[test]
+fn kv_cache_append_is_atomic_when_value_append_fails_cpu() -> Result<()> {
+    let mut cache = candle_nn::kv_cache::KvCache::new(1, 4);
+    let k = Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?;
+    let invalid_v = Tensor::zeros(1, DType::F32, &Device::Cpu)?;
+
+    let err = cache.append(&k, &invalid_v).unwrap_err().to_string();
+    assert!(err.contains("dimension"));
+    assert_eq!(cache.current_seq_len(), 0);
+    assert!(cache.k()?.is_none());
+    assert!(cache.v()?.is_none());
+
     Ok(())
 }
 
@@ -119,5 +161,80 @@ fn rotating_kv_cache() -> Result<()> {
 
         cache.reset();
     }
+    Ok(())
+}
+
+#[test]
+fn rotating_cache_zero_max_seq_len_has_fallible_paths_cpu() -> Result<()> {
+    let mut cache = candle_nn::kv_cache::RotatingCache::new(0, 0);
+
+    assert!(cache.positions(0).is_empty());
+    assert_eq!(cache.positions(2), &[0, 1]);
+    assert!(cache.attn_mask(1, &Device::Cpu)?.is_none());
+    let err = cache.attn_mask(2, &Device::Cpu).unwrap_err().to_string();
+    assert!(err.contains("max_seq_len"));
+
+    let t = Tensor::new(&[1f32], &Device::Cpu)?;
+    let err = cache.append(&t).unwrap_err().to_string();
+    assert!(err.contains("max_seq_len"));
+    assert_eq!(cache.current_seq_len(), 0);
+    assert_eq!(cache.offset(), 0);
+    assert!(cache.current_data()?.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn rotating_kv_cache_append_is_atomic_when_value_append_fails_cpu() -> Result<()> {
+    let mut cache = candle_nn::kv_cache::RotatingKvCache::new(1, 4);
+    let k = Tensor::zeros((1, 1), DType::F32, &Device::Cpu)?;
+    let invalid_v = Tensor::zeros(1, DType::F32, &Device::Cpu)?;
+
+    let err = cache.append(&k, &invalid_v).unwrap_err().to_string();
+    assert!(err.contains("dimension"));
+    assert_eq!(cache.current_seq_len(), 0);
+    assert_eq!(cache.offset(), 0);
+    assert!(cache.k()?.is_none());
+    assert!(cache.v()?.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn concat_kv_cache_append_is_atomic_when_value_cat_fails_cpu() -> Result<()> {
+    let mut cache = candle_nn::kv_cache::ConcatKvCache::new(1);
+    let k1 = Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu)?;
+    let v1 = Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu)?;
+    cache.append(&k1, &v1)?;
+
+    let k2 = Tensor::zeros((1, 1, 2), DType::F32, &Device::Cpu)?;
+    let invalid_v2 = Tensor::zeros((2, 1, 2), DType::F32, &Device::Cpu)?;
+    let err = cache.append(&k2, &invalid_v2).unwrap_err().to_string();
+    assert!(err.contains("shape mismatch") || err.contains("shape"));
+
+    assert_eq!(cache.current_seq_len(), 1);
+    assert_eq!(cache.k().unwrap().dims(), &[1, 1, 2]);
+    assert_eq!(cache.v().unwrap().dims(), &[1, 1, 2]);
+
+    Ok(())
+}
+
+#[test]
+fn scattered_cache_rejects_batch_mask_len_mismatch_cpu() -> Result<()> {
+    let mut cache =
+        candle_nn::kv_cache::ScatteredCacheBuilder::new(2, 5, DType::F32, &Device::Cpu)?;
+
+    let err = cache.indices_and_mask(1, &[true]).unwrap_err().to_string();
+    assert!(err.contains("batch_mask length mismatch"));
+
+    let err = cache
+        .indices_and_mask(1, &[true, false, true])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("batch_mask length mismatch"));
+
+    let err = cache.indices_and_mask(5, &[true]).unwrap_err().to_string();
+    assert!(err.contains("batch_mask length mismatch"));
+
     Ok(())
 }
