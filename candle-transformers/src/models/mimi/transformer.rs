@@ -47,6 +47,30 @@ pub struct Config {
     pub conv_layout: bool,
 }
 
+fn validate_attention_config(cfg: &Config) -> Result<()> {
+    if cfg.num_heads == 0 {
+        candle::bail!("num_heads must be greater than zero")
+    }
+    if cfg.kv_repeat == 0 {
+        candle::bail!("kv_repeat must be greater than zero")
+    }
+    if cfg.d_model % cfg.num_heads != 0 {
+        candle::bail!(
+            "d_model must be divisible by num_heads, got d_model={} and num_heads={}",
+            cfg.d_model,
+            cfg.num_heads
+        )
+    }
+    if cfg.num_heads % cfg.kv_repeat != 0 {
+        candle::bail!(
+            "num_heads must be divisible by kv_repeat, got num_heads={} and kv_repeat={}",
+            cfg.num_heads,
+            cfg.kv_repeat
+        )
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct RotaryEmbedding {
     sin: Tensor,
@@ -120,6 +144,7 @@ pub struct StreamingMultiheadAttention {
 
 impl StreamingMultiheadAttention {
     pub fn new(rope: &Option<Arc<RotaryEmbedding>>, cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        validate_attention_config(cfg)?;
         let embed_dim = cfg.d_model;
         let num_kv = cfg.num_heads / cfg.kv_repeat;
         let kv_dim = num_kv * (embed_dim / cfg.num_heads);
@@ -240,6 +265,7 @@ pub struct StreamingMultiheadCrossAttention {
 
 impl StreamingMultiheadCrossAttention {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        validate_attention_config(cfg)?;
         let embed_dim = cfg.d_model;
         let num_kv = cfg.num_heads / cfg.kv_repeat;
         let kv_dim = num_kv * (embed_dim / cfg.num_heads);
@@ -581,6 +607,10 @@ pub struct StreamingTransformer {
 
 impl StreamingTransformer {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        validate_attention_config(cfg)?;
+        if cfg.num_layers == 0 {
+            candle::bail!("num_layers must be greater than zero")
+        }
         let vb_l = vb.pp("layers");
         let rope = match cfg.positional_embedding {
             PositionalEmbedding::Rope => {
@@ -620,15 +650,29 @@ impl StreamingTransformer {
         let mut xs = match self.positional_embedding {
             PositionalEmbedding::Rope | PositionalEmbedding::None => xs.clone(),
             PositionalEmbedding::Sin => {
+                if c < 2 {
+                    candle::bail!(
+                        "sinusoidal positional embedding requires at least two channels, got {c}"
+                    )
+                }
+                if c % 2 != 0 {
+                    candle::bail!(
+                        "sinusoidal positional embedding requires an even channel count, got {c}"
+                    )
+                }
                 let dev = xs.device();
                 let theta = self.max_period as f32;
                 let half_dim = c / 2;
                 let positions = Tensor::arange(pos as u32, (pos + t) as u32, dev)?
                     .unsqueeze(1)?
                     .to_dtype(DType::F32)?;
-                let inv_freq: Vec<_> = (0..half_dim)
-                    .map(|i| 1f32 / theta.powf(i as f32 / (half_dim - 1) as f32))
-                    .collect();
+                let inv_freq: Vec<_> = if half_dim == 1 {
+                    vec![1f32]
+                } else {
+                    (0..half_dim)
+                        .map(|i| 1f32 / theta.powf(i as f32 / (half_dim - 1) as f32))
+                        .collect()
+                };
                 let inv_freq_len = inv_freq.len();
                 let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
                 let freqs = positions.broadcast_mul(&inv_freq)?;
@@ -757,6 +801,176 @@ impl StreamingModule for ProjectedTransformer {
                 Ok(y.clone())
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::{DType, Device, Tensor};
+    use candle_nn::VarBuilder;
+
+    fn tiny_config() -> Config {
+        Config {
+            d_model: 4,
+            num_heads: 2,
+            num_layers: 1,
+            causal: true,
+            norm_first: true,
+            bias_ff: true,
+            bias_attn: true,
+            layer_scale: None,
+            positional_embedding: PositionalEmbedding::None,
+            use_conv_block: false,
+            cross_attention: false,
+            conv_kernel_size: 3,
+            use_conv_bias: true,
+            gating: None,
+            norm: super::super::NormType::LayerNorm,
+            context: 4,
+            max_period: 10000,
+            max_seq_len: 4,
+            kv_repeat: 1,
+            dim_feedforward: 8,
+            conv_layout: false,
+        }
+    }
+
+    fn assert_err_contains<T: std::fmt::Debug>(result: Result<T>, expected: &str) {
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(expected),
+            "expected error containing {expected:?}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn self_attention_rejects_zero_num_heads() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.num_heads = 0;
+        assert_err_contains(
+            StreamingMultiheadAttention::new(
+                &None,
+                &cfg,
+                VarBuilder::zeros(DType::F32, &device).pp("attn"),
+            ),
+            "num_heads must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn self_attention_rejects_zero_kv_repeat() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.kv_repeat = 0;
+        assert_err_contains(
+            StreamingMultiheadAttention::new(
+                &None,
+                &cfg,
+                VarBuilder::zeros(DType::F32, &device).pp("attn"),
+            ),
+            "kv_repeat must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn self_attention_rejects_non_divisible_model_width() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.d_model = 5;
+        assert_err_contains(
+            StreamingMultiheadAttention::new(
+                &None,
+                &cfg,
+                VarBuilder::zeros(DType::F32, &device).pp("attn"),
+            ),
+            "d_model must be divisible by num_heads",
+        );
+    }
+
+    #[test]
+    fn self_attention_rejects_non_divisible_kv_repeat() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.d_model = 6;
+        cfg.num_heads = 3;
+        cfg.kv_repeat = 2;
+        assert_err_contains(
+            StreamingMultiheadAttention::new(
+                &None,
+                &cfg,
+                VarBuilder::zeros(DType::F32, &device).pp("attn"),
+            ),
+            "num_heads must be divisible by kv_repeat",
+        );
+    }
+
+    #[test]
+    fn cross_attention_rejects_zero_kv_repeat() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.kv_repeat = 0;
+        assert_err_contains(
+            StreamingMultiheadCrossAttention::new(
+                &cfg,
+                VarBuilder::zeros(DType::F32, &device).pp("cross_attn"),
+            ),
+            "kv_repeat must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn streaming_transformer_rejects_zero_layers() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.num_layers = 0;
+        assert_err_contains(
+            StreamingTransformer::new(
+                &cfg,
+                VarBuilder::zeros(DType::F32, &device).pp("transformer"),
+            ),
+            "num_layers must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn sinusoidal_embedding_rejects_too_few_channels() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.d_model = 2;
+        cfg.num_heads = 1;
+        cfg.dim_feedforward = 4;
+        cfg.positional_embedding = PositionalEmbedding::Sin;
+        let mut transformer = StreamingTransformer::new(
+            &cfg,
+            VarBuilder::zeros(DType::F32, &device).pp("transformer"),
+        )?;
+        let xs = Tensor::zeros((1, 1, 1), DType::F32, &device)?;
+        assert_err_contains(
+            transformer.forward(&xs),
+            "sinusoidal positional embedding requires at least two channels",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sinusoidal_embedding_with_two_channels_stays_finite() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.d_model = 2;
+        cfg.num_heads = 1;
+        cfg.dim_feedforward = 4;
+        cfg.positional_embedding = PositionalEmbedding::Sin;
+        let mut transformer = StreamingTransformer::new(
+            &cfg,
+            VarBuilder::zeros(DType::F32, &device).pp("transformer"),
+        )?;
+        let xs = Tensor::zeros((1, 2, 2), DType::F32, &device)?;
+        let ys = transformer.forward(&xs)?;
+        let values = ys.flatten_all()?.to_vec1::<f32>()?;
+        assert!(values.iter().all(|v| v.is_finite()), "{values:?}");
+        Ok(())
     }
 }
 
