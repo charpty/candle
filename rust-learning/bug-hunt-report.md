@@ -1,17 +1,18 @@
-# Candle bug hunt 报告：七十四个 public API 边界修复
+# Candle bug hunt 报告：八十个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复七十四个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复八十个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
 和 mask 对齐语义；BUG-057 到 BUG-059 覆盖 Gemma4 audio forward 输入合同；BUG-060 到 BUG-062
 继续覆盖 Gemma4 multimodal/vision 的运行期数量和 pooling 边界；BUG-063 到 BUG-069 覆盖
 Qwen3-VL vision 构造期配置；BUG-070 到 BUG-074 覆盖 Qwen3-VL text attention 配置和空序列
-forward 边界。
+forward 边界；BUG-075 到 BUG-080 覆盖 Qwen3-VL 外层 forward 的 per-batch 元数据和 image/video
+placeholder span 合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -96,6 +97,12 @@ forward 边界。
 | BUG-072 | [candle-transformers/src/models/qwen3_vl/text.rs](../candle-transformers/src/models/qwen3_vl/text.rs) | `num_attention_heads % num_key_value_heads != 0` 时 GQA group 数静默截断 | 要求 attention heads 可被 KV heads 整除 |
 | BUG-073 | [candle-transformers/src/models/qwen3_vl/text.rs](../candle-transformers/src/models/qwen3_vl/text.rs) | `head_dim = 0` 会构造空 RoPE/RmsNorm，并让 softmax scale 失去语义 | 构造阶段拒绝零 head dim |
 | BUG-074 | [candle-transformers/src/models/qwen3_vl/text.rs](../candle-transformers/src/models/qwen3_vl/text.rs) | `[B, 0, H]` 空序列会进入 attention/last-token 路径，得到间接 reshape 错误 | `forward_embeds` 入口拒绝空序列 |
+| BUG-075 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `seqlen_offsets = []` 且 `seqlen <= 1` 时直接索引 `seqlen_offsets[0]` panic | forward 入口拒绝空 offsets |
+| BUG-076 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `seqlen_offsets.len() != batch_size` 被静默接受，后续 RoPE/attention batch 语义不闭合 | 要求 offsets 数量匹配 batch |
+| BUG-077 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `seqlens = []` 在 `seqlens.iter().max().unwrap()` 处 panic | forward 入口拒绝空 seqlens |
+| BUG-078 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `seqlens.len() != batch_size` 被静默接受，per-batch 元数据和输入 batch 脱节 | 要求 seqlens 数量匹配 batch |
+| BUG-079 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | image placeholder span `start > end` 在 `end - start` 处下溢 panic | 计算长度前校验 image span 顺序和范围 |
+| BUG-080 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | video placeholder span `start > end` 在 `end - start` 处下溢 panic | 计算长度前校验 video span 顺序和范围 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -1778,7 +1785,84 @@ git diff --check
 - `agent/bug-073-qwen3-vl-text-zero-head-dim`
 - `agent/bug-074-qwen3-vl-text-empty-sequence`
 
-## 七十四个案例教什么
+## BUG-075 到 BUG-080：Qwen3-VL forward glue 输入合同
+
+受影响文件：
+
+- [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs)
+
+这一组问题不在单个 attention 算子里，而在多模态模型的外层 glue。`Qwen3VLModel::forward`
+同时接收文本 token、image/video pixel tensor、grid metadata、placeholder span、`seqlens` 和
+`seqlen_offsets`。这些参数共同定义“每个 batch 的 token 序列和视觉 embedding 如何对齐”。
+
+原代码里有三个典型边界点：
+
+```rust
+seqlen_offsets[0]
+seqlens.iter().max().unwrap()
+spans.iter().map(|(s, e)| e - s)
+```
+
+这些写法本身不一定错，但前提是调用入口已经证明：
+
+- `seqlen_offsets` 非空，且长度等于 batch size。
+- `seqlens` 非空，且长度等于 batch size。
+- 每个 placeholder span 满足 `start <= end <= seq_len`。
+
+修复前我先只加测试、不加修复，跑：
+
+```bash
+cargo test -p candle-transformers models::qwen3_vl::tests
+```
+
+6 个测试全部失败，失败形态分别是：
+
+- `seqlen_offsets = []`：`seqlen_offsets[0]` 直接 index out of bounds。
+- `seqlen_offsets.len() != batch_size`：模型返回 `Ok`，静默接受了和 batch 不一致的 offsets。
+- `seqlens = []`：`seqlens.iter().max().unwrap()` 对 `None` unwrap。
+- `seqlens.len() != batch_size`：模型返回 `Ok`，静默接受了和 batch 不一致的 per-batch 元数据。
+- image placeholder span `(1, 0)`：计算 `end - start` 时 `usize` 下溢 panic。
+- video placeholder span `(1, 0)`：同样在 `end - start` 处下溢 panic。
+
+修复策略：
+
+1. 新增 `validate_sequence_metadata`，在 forward 入口先校验 `seqlens` 和 `seqlen_offsets`。
+2. 新增 `validate_placeholder_spans`，在调用 vision encoder 前先校验 image/video spans。
+3. `validate_placeholder_spans` 返回已校验的 `total_expected`，替代原来的 `map(|(s, e)| e - s).sum()`。
+4. span 总长度使用 `checked_add`，避免极端情况下累计长度溢出。
+
+新增测试：
+
+- `model_rejects_empty_seqlen_offsets`
+- `model_rejects_seqlen_offsets_batch_mismatch`
+- `model_rejects_empty_seqlens`
+- `model_rejects_seqlens_batch_mismatch`
+- `model_rejects_reversed_image_placeholder_span`
+- `model_rejects_reversed_video_placeholder_span`
+
+测试夹具里有一个容易忽略的细节：Qwen3-VL 的 `conv3d_temporal_2` 明确假设 temporal patch size
+为 2，因此最小 vision fixture 也要用 `temporal_patch_size = 2`，pixel row 长度是
+`in_chans * temporal_patch_size * patch_size * patch_size = 6`。否则测试会在模型构造阶段失败，
+还没进入要验证的 forward 边界。
+
+修复后验证：
+
+```bash
+cargo test -p candle-transformers models::qwen3_vl::tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-075-qwen3-vl-empty-seqlen-offsets`
+- `agent/bug-076-qwen3-vl-seqlen-offset-batch-mismatch`
+- `agent/bug-077-qwen3-vl-empty-seqlens`
+- `agent/bug-078-qwen3-vl-seqlens-batch-mismatch`
+- `agent/bug-079-qwen3-vl-reversed-image-span`
+- `agent/bug-080-qwen3-vl-reversed-video-span`
+
+## 八十个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
