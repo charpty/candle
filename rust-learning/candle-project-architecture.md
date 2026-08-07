@@ -313,7 +313,7 @@ cargo run -p candle-examples --example rust-candle-tour -- --cpu
 
 ## 10. 真实 bug 案例
 
-这次 bug hunt 累计修了 53 个 public API 边界问题，覆盖 Candle 的十三条典型边界：
+这次 bug hunt 累计修了 56 个 public API 边界问题，覆盖 Candle 的十四条典型边界：
 
 | bug | 所在层 | 教学价值 |
 | --- | --- | --- |
@@ -330,6 +330,7 @@ cargo run -p candle-examples --example rust-candle-tour -- --cpu
 | Mimi transformer 配置 | `candle-transformers` 模型构造 | `num_heads`、`kv_repeat`、`d_model` 和 Sin 位置编码 channel 数都属于构造/forward 前置合同。 |
 | Gemma4 vision/text 配置 | `candle-transformers` 多模态模型 | 新模型往往有更多分支配置，KV heads、RoPE head dim、patch/pooling 和空输入都要单独打 UT。 |
 | Gemma4 audio Conformer 配置 | `candle-transformers` 多模态模型 | 分块 attention、relative position、SSCP conv 和 light conv 都会从 config 派生 shape，数组长度和 0 参数必须前置校验。 |
+| Gemma4 multimodal mask 对齐 | `candle-transformers` glue 层 | 特殊 token mask 和 encoder embedding 数量必须严格对齐；单 batch、多 batch和数量不匹配都要测。 |
 
 ### 10.1 `replication_pad2d`
 
@@ -426,7 +427,7 @@ decode step。修复时不能只让当前调用返回 `Err`，还要断言失败
 这批案例的判断口径更严格：不是“配置不推荐”，而是构造函数内部会直接除零、静默截断必要维度，
 或在返回 `Result<Self>` 的加载函数里 panic。详细复现和修复见 [bug-hunt-report.md](./bug-hunt-report.md)。
 
-这 53 个 bug 值得放进学习资料，因为它们展示了 Rust/Candle 源码审计的正确顺序：
+这 56 个 bug 值得放进学习资料，因为它们展示了 Rust/Candle 源码审计的正确顺序：
 
 1. 先看 public API 签名。返回 `Result` 的函数不应该轻易 panic。
 2. 再看 shape 合同。4D Tensor 不等于空间维度一定非空。

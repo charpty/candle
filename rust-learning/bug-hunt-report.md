@@ -1,13 +1,14 @@
-# Candle bug hunt 报告：五十三个 public API 边界修复
+# Candle bug hunt 报告：五十六个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复五十三个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复五十六个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
-Conformer attention 和 SSCP conv 配置。
+Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
+和 mask 对齐语义。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -71,6 +72,9 @@ Conformer attention 和 SSCP conv 配置。
 | BUG-051 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | SSCP stride 为 0 时 frequency 输出计算除零 | 校验 stride time/freq 都大于 0 |
 | BUG-052 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | SSCP frequency kernel 大于 padded frequency 时 `usize` 下溢 | 构造阶段检查 kernel 能放入 padded frequency |
 | BUG-053 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | `conf_conv_kernel_size = 0` 使 light conv causal padding 下溢 | 构造阶段拒绝零 conformer conv kernel |
+| BUG-054 | [candle-transformers/src/models/gemma4/mod.rs](../candle-transformers/src/models/gemma4/mod.rs) | 单 batch multimodal embeddings 从序列开头铺开，mask 在后面时会取错或取 0 | 按 mask true 位置顺序 gather embeddings |
+| BUG-055 | [candle-transformers/src/models/gemma4/mod.rs](../candle-transformers/src/models/gemma4/mod.rs) | 多 batch multimodal embedding helper 直接返回全 0 | 支持 row-major 跨 batch 放置 |
+| BUG-056 | [candle-transformers/src/models/gemma4/mod.rs](../candle-transformers/src/models/gemma4/mod.rs) | embedding 数量和 mask token 数不一致时静默 pad/truncate | 数量不一致直接返回错误 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -1456,7 +1460,57 @@ cargo test -p candle-transformers models::gemma4::audio::tests
 - `agent/bug-052-gemma4-audio-oversized-sscp-kernel`
 - `agent/bug-053-gemma4-audio-zero-conv-kernel`
 
-## 五十三个案例教什么
+## BUG-054 到 BUG-056：Gemma4 multimodal embedding 与 mask 对齐
+
+受影响文件：
+
+- [candle-transformers/src/models/gemma4/mod.rs](../candle-transformers/src/models/gemma4/mod.rs)
+
+`forward_multimodal` 会先得到 text token embeddings，然后把 image/audio encoder 输出投影到 text hidden size，
+再替换输入序列中的特殊 token 位置。关键 helper 是：
+
+```rust
+fn broadcast_embed_to_mask(embeds: &Tensor, mask: &Tensor) -> Result<Tensor>
+```
+
+它的合同应该是：
+
+```text
+按 mask 中 true 的位置，从左到右、从 batch 0 到 batch N，依次放入 embeds 的第 0、1、2... 行。
+```
+
+原实现有三类问题：
+
+- 单 batch 时只是把 embeds 从序列开头 pad/truncate 到 `seq_len`，并没有放到 mask 为 true 的位置。
+- 多 batch 时直接返回全 0，导致 multimodal features 被静默丢掉。
+- `embeds.len()` 和 mask token 数不一致时静默 pad 或 truncate，调用者无法发现 prompt 中特殊 token 数错了。
+
+修复策略：
+
+1. 把 mask flatten 到 host，统计 true token 数。
+2. 要求 embedding 行数和 mask true 数完全一致。
+3. 构造一个 row-major gather index：mask true 的位置依次拿下一个 embed，mask false 的位置临时拿 0。
+4. `index_select` 后 reshape 成 `[B, S, H]`，再乘 mask，把 false 位置清零。
+
+新增测试：
+
+- `broadcast_embed_to_mask_places_single_batch_tokens_at_mask_positions`
+- `broadcast_embed_to_mask_places_multi_batch_tokens_in_row_major_order`
+- `broadcast_embed_to_mask_rejects_embedding_count_mismatch`
+
+已运行：
+
+```bash
+cargo test -p candle-transformers models::gemma4::tests
+```
+
+分支：
+
+- `agent/bug-054-gemma4-single-batch-embed-placement`
+- `agent/bug-055-gemma4-multi-batch-embed-placement`
+- `agent/bug-056-gemma4-embed-mask-count-mismatch`
+
+## 五十六个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
