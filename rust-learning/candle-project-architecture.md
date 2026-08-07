@@ -313,7 +313,7 @@ cargo run -p candle-examples --example rust-candle-tour -- --cpu
 
 ## 10. 真实 bug 案例
 
-这次 bug hunt 累计修了 69 个 public API 边界问题，覆盖 Candle 的十七条典型边界：
+这次 bug hunt 累计修了 74 个 public API 边界问题，覆盖 Candle 的十八条典型边界：
 
 | bug | 所在层 | 教学价值 |
 | --- | --- | --- |
@@ -334,6 +334,7 @@ cargo run -p candle-examples --example rust-candle-tour -- --cpu
 | Gemma4 audio forward 输入 | `candle-transformers` 多模态模型 | mask 不能靠 Tensor 广播补齐 batch/time；public forward 要先拒绝错形状和空时间维。 |
 | Gemma4 vision pooling 边界 | `candle-transformers` 多模态模型 | runtime 图像尺寸也会让合法配置派生出 0 token；pooler 自己要防止零输出长度。 |
 | Qwen3-VL vision 配置 | `candle-transformers` 多模态模型 | 新视觉模型的 head、patch、merge、position grid 都会参与除法/reshape/RoPE，需要集中校验。 |
+| Qwen3-VL text 配置和空序列 | `candle-transformers` 多模态模型 | GQA 的 heads/KV heads/head_dim 要在构造期校验，`[B,0,H]` 空序列要在 forward 入口拒绝。 |
 
 ### 10.1 `replication_pad2d`
 
@@ -430,7 +431,7 @@ decode step。修复时不能只让当前调用返回 `Err`，还要断言失败
 这批案例的判断口径更严格：不是“配置不推荐”，而是构造函数内部会直接除零、静默截断必要维度，
 或在返回 `Result<Self>` 的加载函数里 panic。详细复现和修复见 [bug-hunt-report.md](./bug-hunt-report.md)。
 
-这 69 个 bug 值得放进学习资料，因为它们展示了 Rust/Candle 源码审计的正确顺序：
+这 74 个 bug 值得放进学习资料，因为它们展示了 Rust/Candle 源码审计的正确顺序：
 
 1. 先看 public API 签名。返回 `Result` 的函数不应该轻易 panic。
 2. 再看 shape 合同。4D Tensor 不等于空间维度一定非空。

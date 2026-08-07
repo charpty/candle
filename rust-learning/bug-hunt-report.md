@@ -1,16 +1,17 @@
-# Candle bug hunt 报告：六十九个 public API 边界修复
+# Candle bug hunt 报告：七十四个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复六十九个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复七十四个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
 和 mask 对齐语义；BUG-057 到 BUG-059 覆盖 Gemma4 audio forward 输入合同；BUG-060 到 BUG-062
 继续覆盖 Gemma4 multimodal/vision 的运行期数量和 pooling 边界；BUG-063 到 BUG-069 覆盖
-Qwen3-VL vision 构造期配置。
+Qwen3-VL vision 构造期配置；BUG-070 到 BUG-074 覆盖 Qwen3-VL text attention 配置和空序列
+forward 边界。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -90,6 +91,11 @@ Qwen3-VL vision 构造期配置。
 | BUG-067 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `temporal_patch_size = 0` 会进入 Conv3D kernel/reshape 非法配置 | 构造阶段拒绝零 temporal patch |
 | BUG-068 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `spatial_merge_size = 0` 使 merger 后续取模/除法为 0 | 构造阶段拒绝零 spatial merge |
 | BUG-069 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `num_position_embeddings = 0` 被当作平方数接受，后续 grid 插值会下溢 | 构造阶段拒绝零 position embeddings |
+| BUG-070 | [candle-transformers/src/models/qwen3_vl/text.rs](../candle-transformers/src/models/qwen3_vl/text.rs) | Qwen3-VL text `num_attention_heads = 0` 被构造函数接受，产生无效 zero-head attention | 构造阶段拒绝零 attention heads |
+| BUG-071 | [candle-transformers/src/models/qwen3_vl/text.rs](../candle-transformers/src/models/qwen3_vl/text.rs) | `num_key_value_heads = 0` 在 `num_attention_heads / num_key_value_heads` 处 panic | 构造阶段拒绝零 KV heads |
+| BUG-072 | [candle-transformers/src/models/qwen3_vl/text.rs](../candle-transformers/src/models/qwen3_vl/text.rs) | `num_attention_heads % num_key_value_heads != 0` 时 GQA group 数静默截断 | 要求 attention heads 可被 KV heads 整除 |
+| BUG-073 | [candle-transformers/src/models/qwen3_vl/text.rs](../candle-transformers/src/models/qwen3_vl/text.rs) | `head_dim = 0` 会构造空 RoPE/RmsNorm，并让 softmax scale 失去语义 | 构造阶段拒绝零 head dim |
+| BUG-074 | [candle-transformers/src/models/qwen3_vl/text.rs](../candle-transformers/src/models/qwen3_vl/text.rs) | `[B, 0, H]` 空序列会进入 attention/last-token 路径，得到间接 reshape 错误 | `forward_embeds` 入口拒绝空序列 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -1698,7 +1704,81 @@ cargo test -p candle-transformers models::qwen3_vl::vision::tests
 - `agent/bug-068-qwen3-vl-vision-zero-spatial-merge`
 - `agent/bug-069-qwen3-vl-vision-zero-position-embeddings`
 
-## 六十九个案例教什么
+## BUG-070 到 BUG-074：Qwen3-VL text attention 配置和空序列
+
+受影响文件：
+
+- [candle-transformers/src/models/qwen3_vl/text.rs](../candle-transformers/src/models/qwen3_vl/text.rs)
+
+Qwen3-VL text 的 attention 是典型 GQA 结构。构造函数会从 config 派生下面这些值：
+
+```rust
+let num_heads = cfg.num_attention_heads;
+let num_kv_heads = cfg.num_key_value_heads;
+let q_proj = linear_b(hidden_sz, num_heads * cfg.head_dim, false, vb.pp("q_proj"))?;
+let k_proj = linear_b(hidden_sz, num_kv_heads * cfg.head_dim, false, vb.pp("k_proj"))?;
+let n_kv_groups = cfg.num_attention_heads / cfg.num_key_value_heads;
+let softmax_scale = 1.0 / (cfg.head_dim as f64).sqrt();
+```
+
+这里的边界不应该等到 forward 里靠 reshape、matmul 或 softmax 间接暴露。原因很直接：
+
+- `num_attention_heads = 0` 会构造 zero-head attention，`num_attn_heads` 还会被外层 mask expand 使用。
+- `num_key_value_heads = 0` 会在构造阶段直接除零 panic，绕过 `Result<Self>`。
+- `num_attention_heads % num_key_value_heads != 0` 时，`n_kv_groups` 使用整数除法静默截断，Q heads 和 K/V heads 组数合同已经不成立。
+- `head_dim = 0` 会构造空 RoPE/RmsNorm，并让 `1.0 / sqrt(0)` 变成非有限 scale 语义。
+- `forward_embeds` 输入 `[B, 0, H]` 时，调用方拿到的是底层 reshape 错误，旧代码还存在后续 `seq_len - 1` 这类 last-token 边界风险。
+
+我先只加测试、不加修复，在官方 main 基线上跑：
+
+```bash
+cargo test -p candle-transformers models::qwen3_vl::text::tests
+```
+
+修复前 5 个测试全部失败，失败形态分别是：
+
+- `num_attention_heads = 0`：构造函数返回 `Ok`，没有拒绝非法 zero-head attention。
+- `num_key_value_heads = 0`：在 `num_attention_heads / num_key_value_heads` 处 panic，信息是 `attempt to divide by zero`。
+- heads/KV heads 不整除：构造函数返回 `Ok`，GQA group 数被静默截断。
+- `head_dim = 0`：构造函数返回 `Ok`，接受了无效 head 维度。
+- 空序列：没有得到明确的空序列错误，而是 `cannot reshape tensor of 0 elements to (1, 0, ())`。
+
+修复策略：
+
+1. 新增 `validate_attention_config`，在构造期拒绝：
+   - `num_attention_heads == 0`
+   - `num_key_value_heads == 0`
+   - `num_attention_heads % num_key_value_heads != 0`
+   - `head_dim == 0`
+2. `Qwen3VLTextModel::new` 和 `Attention::new` 都调用校验。前者保护 public 构造 API，后者保护模块内部未来新增构造路径。
+3. `forward_embeds` 在进入 decoder layers 前拒绝 `seq_len == 0`。
+4. 顺手把 attention mask 的 device 迁移从 `unwrap()` 改成 `?`，保持错误传播风格一致。
+
+新增测试：
+
+- `text_model_rejects_zero_attention_heads`
+- `text_model_rejects_zero_key_value_heads`
+- `text_model_rejects_non_divisible_key_value_heads`
+- `text_model_rejects_zero_head_dim`
+- `text_model_rejects_empty_input_sequence`
+
+修复后验证：
+
+```bash
+cargo test -p candle-transformers models::qwen3_vl::text::tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-070-qwen3-vl-text-zero-attention-heads`
+- `agent/bug-071-qwen3-vl-text-zero-kv-heads`
+- `agent/bug-072-qwen3-vl-text-kv-head-divisibility`
+- `agent/bug-073-qwen3-vl-text-zero-head-dim`
+- `agent/bug-074-qwen3-vl-text-empty-sequence`
+
+## 七十四个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
