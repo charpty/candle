@@ -12,6 +12,45 @@ use candle_nn::{embedding, linear_b, rms_norm, Embedding, Linear, Module, RmsNor
 
 use super::config::TextConfig;
 
+fn validate_text_config(cfg: &TextConfig) -> Result<()> {
+    if cfg.num_attention_heads == 0 {
+        candle::bail!("num_attention_heads must be greater than zero");
+    }
+    if cfg.num_key_value_heads == 0 {
+        candle::bail!("num_key_value_heads must be greater than zero");
+    }
+    if cfg.num_attention_heads % cfg.num_key_value_heads != 0 {
+        candle::bail!(
+            "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads
+        );
+    }
+    if cfg.head_dim == 0 {
+        candle::bail!("head_dim must be greater than zero");
+    }
+    if cfg.head_dim % 2 != 0 {
+        candle::bail!("head_dim ({}) must be even", cfg.head_dim);
+    }
+    let Some(mrope_dim) = cfg
+        .mrope_section
+        .iter()
+        .try_fold(0usize, |acc, section| acc.checked_add(*section))
+    else {
+        candle::bail!("mrope_section total size overflows usize");
+    };
+    let Some(mrope_dim) = mrope_dim.checked_mul(2) else {
+        candle::bail!("mrope_section repeated size overflows usize");
+    };
+    if mrope_dim != cfg.head_dim {
+        candle::bail!(
+            "mrope_section repeated size ({mrope_dim}) must match head_dim ({})",
+            cfg.head_dim
+        );
+    }
+    Ok(())
+}
+
 /// Multimodal Rotary Position Embedding (M-RoPE).
 ///
 /// Unlike standard 1D RoPE, M-RoPE supports 3D position IDs for vision tokens:
@@ -739,6 +778,7 @@ struct Attention {
 
 impl Attention {
     fn new(rotary_emb: Arc<RotaryEmbedding>, cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+        validate_text_config(cfg)?;
         let hidden_sz = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;
@@ -1107,6 +1147,7 @@ pub struct TextModel {
 
 impl TextModel {
     pub fn new(cfg: &TextConfig, vb: VarBuilder) -> Result<Self> {
+        validate_text_config(cfg)?;
         let vb_m = vb.pp("model");
 
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
@@ -1175,6 +1216,9 @@ impl TextModel {
         position_ids: &Tensor,
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = xs.dims3()?;
+        if seq_len == 0 {
+            candle::bail!("PaddleOCR-VL text input sequence length must be greater than zero");
+        }
 
         // Create causal attention mask for prefill
         let attention_mask = if seq_len <= 1 {
@@ -1256,5 +1300,94 @@ impl TextModel {
         tensors.insert("logits".to_string(), logits.clone());
 
         Ok((logits, tensors))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::Activation;
+
+    fn tiny_text_config() -> TextConfig {
+        TextConfig {
+            vocab_size: 8,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            hidden_act: Activation::Silu,
+            max_position_embeddings: 8,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            head_dim: 4,
+            use_bias: false,
+            tie_word_embeddings: true,
+            mrope_section: vec![1, 1, 0],
+        }
+    }
+
+    fn new_model(cfg: &TextConfig) -> Result<TextModel> {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        TextModel::new(cfg, vb)
+    }
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_model_rejects_zero_attention_heads() {
+        let mut cfg = tiny_text_config();
+        cfg.num_attention_heads = 0;
+        assert_err_contains(new_model(&cfg), "num_attention_heads");
+    }
+
+    #[test]
+    fn text_model_rejects_zero_key_value_heads() {
+        let mut cfg = tiny_text_config();
+        cfg.num_key_value_heads = 0;
+        assert_err_contains(new_model(&cfg), "num_key_value_heads");
+    }
+
+    #[test]
+    fn text_model_rejects_non_divisible_key_value_heads() {
+        let mut cfg = tiny_text_config();
+        cfg.num_attention_heads = 3;
+        cfg.num_key_value_heads = 2;
+        assert_err_contains(new_model(&cfg), "divisible");
+    }
+
+    #[test]
+    fn text_model_rejects_zero_head_dim() {
+        let mut cfg = tiny_text_config();
+        cfg.head_dim = 0;
+        assert_err_contains(new_model(&cfg), "head_dim");
+    }
+
+    #[test]
+    fn text_model_rejects_empty_input_sequence() -> Result<()> {
+        let mut cfg = tiny_text_config();
+        cfg.num_hidden_layers = 0;
+        let device = Device::Cpu;
+        let mut model = new_model(&cfg)?;
+        let xs = Tensor::zeros((1, 0, cfg.hidden_size), DType::F32, &device)?;
+        let position_ids = Tensor::zeros((3, 1, 0), DType::U32, &device)?;
+
+        assert_err_contains(
+            model.forward_embeds_with_mrope(xs, &position_ids),
+            "sequence length",
+        );
+        Ok(())
     }
 }
