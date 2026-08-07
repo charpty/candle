@@ -118,6 +118,16 @@ fn calculate_default_inv_freq(cfg: &Config) -> Vec<f32> {
 
 impl Cache {
     pub fn new(use_kv_cache: bool, dtype: DType, config: &Config, device: &Device) -> Result<Self> {
+        if config.num_attention_heads == 0 {
+            candle::bail!("num_attention_heads must be greater than zero")
+        }
+        if config.hidden_size % config.num_attention_heads != 0 {
+            candle::bail!(
+                "hidden_size {} must be divisible by num_attention_heads {}",
+                config.hidden_size,
+                config.num_attention_heads
+            )
+        }
         // precompute freqs_cis
         let theta = match &config.rope_scaling {
             None
@@ -448,8 +458,8 @@ impl Granite {
         let lm_head = linear(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
         let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
-            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), cfg).unwrap())
-            .collect();
+            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), cfg))
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             wte,
@@ -457,5 +467,67 @@ impl Granite {
             ln_f,
             lm_head,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_config() -> Config {
+        Config {
+            hidden_size: 4,
+            intermediate_size: 8,
+            vocab_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            use_flash_attn: false,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            bos_token_id: None,
+            eos_token_id: None,
+            rope_scaling: None,
+            max_position_embeddings: 4,
+        }
+    }
+
+    #[test]
+    fn cache_rejects_zero_attention_heads() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.num_attention_heads = 0;
+
+        let err = Cache::new(false, DType::F32, &cfg, &device)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("num_attention_heads"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn load_returns_error_when_block_weights_are_missing() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = tiny_config();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.embed_tokens.weight".to_string(),
+            Tensor::zeros((cfg.vocab_size, cfg.hidden_size), DType::F32, &device)?,
+        );
+        tensors.insert(
+            "lm_head.weight".to_string(),
+            Tensor::zeros((cfg.vocab_size, cfg.hidden_size), DType::F32, &device)?,
+        );
+        tensors.insert(
+            "model.norm.weight".to_string(),
+            Tensor::ones(cfg.hidden_size, DType::F32, &device)?,
+        );
+
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let err = Granite::load(vb, &cfg).unwrap_err().to_string();
+        assert!(err.contains("model.layers.0"));
+
+        Ok(())
     }
 }
