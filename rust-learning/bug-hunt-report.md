@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：九十二个 public API 边界修复
+# Candle bug hunt 报告：九十七个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复九十二个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复九十七个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -13,7 +13,8 @@ Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 mul
 Qwen3-VL vision 构造期配置；BUG-070 到 BUG-074 覆盖 Qwen3-VL text attention 配置和空序列
 forward 边界；BUG-075 到 BUG-080 覆盖 Qwen3-VL 外层 forward 的 per-batch 元数据和 image/video
 placeholder span 合同；BUG-081 到 BUG-086 覆盖 Qwen3-VL vision runtime `grid_thw` 合同；
-BUG-087 到 BUG-092 覆盖 PaddleOCR-VL vision 构造期配置。
+BUG-087 到 BUG-092 覆盖 PaddleOCR-VL vision 构造期配置；BUG-093 到 BUG-097 覆盖
+PaddleOCR-VL text attention 配置和空序列 forward 合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -116,6 +117,11 @@ BUG-087 到 BUG-092 覆盖 PaddleOCR-VL vision 构造期配置。
 | BUG-090 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `patch_size = 0` 在 position embedding base grid 计算时除零 | 构造阶段拒绝零 patch |
 | BUG-091 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `image_size % patch_size != 0` 时 base position grid 静默截断 | 要求 image size 可被 patch size 整除 |
 | BUG-092 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `spatial_merge_size = 0` 被 Projector 构造接受，forward 后续除零 | Projector/VisionModel 构造阶段拒绝零 spatial merge |
+| BUG-093 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | PaddleOCR-VL text `num_attention_heads = 0` 被构造函数接受，产生无效 zero-head attention | 构造阶段拒绝零 attention heads |
+| BUG-094 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `num_key_value_heads = 0` 在 GQA repeat 计算中除零 panic | 构造阶段拒绝零 KV heads |
+| BUG-095 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `num_attention_heads % num_key_value_heads != 0` 时 GQA group 数静默截断 | 要求 attention heads 可被 KV heads 整除 |
+| BUG-096 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `head_dim = 0` 会构造空 RoPE/attention，并让 softmax scale 失去语义 | 构造阶段拒绝零 head dim |
+| BUG-097 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `[B, 0, H]` 空序列进入 forward 后得到间接 reshape 错误 | `forward_embeds_with_mrope` 入口拒绝空序列 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2003,7 +2009,67 @@ git diff --check
 - `agent/bug-091-paddleocr-vl-image-patch-divisibility`
 - `agent/bug-092-paddleocr-vl-zero-spatial-merge`
 
-## 九十二个案例教什么
+## BUG-093 到 BUG-097：PaddleOCR-VL text 配置和空序列
+
+受影响文件：
+
+- [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs)
+
+PaddleOCR-VL text decoder 是 ERNIE-4.5 风格的 causal decoder。它的 attention 构造会从
+`TextConfig` 派生这些值：
+
+```rust
+let num_kv_groups = num_heads / num_kv_heads;
+let q_proj = linear_b(hidden_sz, num_heads * head_dim, ...)?;
+let k_proj = linear_b(hidden_sz, num_kv_heads * head_dim, ...)?;
+let softmax_scale = 1.0 / (head_dim as f64).sqrt();
+```
+
+这些不是“可选优化参数”，而是 attention shape 合同。只要 heads、KV heads 或 head_dim 为 0，
+或者 GQA 分组不能整除，模型就无法定义一条可靠的 forward 路径。
+
+修复前 5 个测试的失败形态：
+
+- `num_attention_heads = 0`：构造函数返回 `Ok`，产生语义无效的 zero-head attention。
+- `num_key_value_heads = 0`：`num_heads / num_kv_heads` 直接除零 panic。
+- `num_attention_heads = 3, num_key_value_heads = 2`：构造函数返回 `Ok`，GQA group 数从 1.5 静默截断成 1。
+- `head_dim = 0`：构造函数返回 `Ok`，后续 attention/softmax scale 没有有效 head 维语义。
+- 输入 embedding shape 为 `[B, 0, H]`：forward 进入最后 token 选择路径，得到间接 reshape/索引错误。
+
+修复策略：
+
+1. 新增 `validate_text_config`，在 `TextModel::new` 和 `Attention::new` 都调用，避免直接构造
+   attention 时绕过 text model 总入口。
+2. 构造期拒绝零 attention heads、零 KV heads、heads/KV heads 不整除、零 head_dim。
+3. 同一校验函数也收紧 `head_dim` 的偶数性和 `mrope_section` 总宽度，防止 M-RoPE section
+   与 head 维度不一致；本批编号只按已经独立复现的 5 个失败形态计数。
+4. `forward_embeds_with_mrope` 在读取最后 token 前先拒绝 `seq_len == 0`，把间接错误变成入口合同错误。
+
+新增测试：
+
+- `text_model_rejects_zero_attention_heads`
+- `text_model_rejects_zero_key_value_heads`
+- `text_model_rejects_non_divisible_key_value_heads`
+- `text_model_rejects_zero_head_dim`
+- `text_model_rejects_empty_input_sequence`
+
+修复后验证：
+
+```bash
+cargo test -p candle-transformers models::paddleocr_vl::text::tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-093-paddleocr-vl-text-zero-attention-heads`
+- `agent/bug-094-paddleocr-vl-text-zero-kv-heads`
+- `agent/bug-095-paddleocr-vl-text-kv-head-divisibility`
+- `agent/bug-096-paddleocr-vl-text-zero-head-dim`
+- `agent/bug-097-paddleocr-vl-text-empty-sequence`
+
+## 九十七个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
