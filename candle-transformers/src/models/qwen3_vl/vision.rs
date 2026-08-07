@@ -379,6 +379,73 @@ impl Qwen3VLVisionModel {
         (0..steps).map(|i| i as f32 * step).collect()
     }
 
+    fn validate_grid_thw(
+        &self,
+        grid_thw: &Tensor,
+        expected_tokens: Option<usize>,
+    ) -> Result<usize> {
+        let (rows, cols) = grid_thw.dims2()?;
+        if rows == 0 {
+            candle::bail!("grid_thw must contain at least one row");
+        }
+        if cols != 3 {
+            candle::bail!("grid_thw must have shape [N, 3], got [N, {cols}]");
+        }
+        if self.spatial_merge_size == 0 {
+            candle::bail!("spatial_merge_size must be greater than zero");
+        }
+
+        let grid = grid_thw.to_vec2::<u32>()?;
+        let mut total = 0usize;
+        for (idx, g) in grid.iter().enumerate() {
+            let t = g[0] as usize;
+            let h = g[1] as usize;
+            let w = g[2] as usize;
+            if t == 0 {
+                candle::bail!("grid_thw row {idx} temporal dimension must be greater than zero");
+            }
+            if h == 0 {
+                candle::bail!("grid_thw row {idx} height must be greater than zero");
+            }
+            if w == 0 {
+                candle::bail!("grid_thw row {idx} width must be greater than zero");
+            }
+            if h % self.spatial_merge_size != 0 {
+                candle::bail!(
+                    "grid_thw row {idx} height ({h}) must be divisible by spatial_merge_size ({})",
+                    self.spatial_merge_size
+                );
+            }
+            if w % self.spatial_merge_size != 0 {
+                candle::bail!(
+                    "grid_thw row {idx} width ({w}) must be divisible by spatial_merge_size ({})",
+                    self.spatial_merge_size
+                );
+            }
+
+            let Some(area) = g[1].checked_mul(g[2]) else {
+                candle::bail!("grid_thw row {idx} area overflows u32: height {h}, width {w}");
+            };
+            let area = area as usize;
+            let Some(tokens) = t.checked_mul(area) else {
+                candle::bail!("grid_thw row {idx} token count overflow");
+            };
+            let Some(next_total) = total.checked_add(tokens) else {
+                candle::bail!("grid_thw total token count overflow");
+            };
+            total = next_total;
+        }
+
+        if let Some(expected_tokens) = expected_tokens {
+            if total != expected_tokens {
+                candle::bail!(
+                    "grid_thw token count ({total}) must match visual tokens ({expected_tokens})"
+                );
+            }
+        }
+        Ok(total)
+    }
+
     fn fast_pos_embed_interpolate(&self, grid_thw: &Tensor) -> Result<Tensor> {
         let device = self.pos_embed.embeddings().device();
         let dtype = self.pos_embed.embeddings().dtype();
@@ -541,14 +608,17 @@ impl Qwen3VLVisionModel {
     }
 
     fn build_cu_seqlens(&self, grid_thw: &Tensor) -> Result<Vec<usize>> {
+        self.validate_grid_thw(grid_thw, None)?;
         let grid = grid_thw.to_vec2::<u32>()?;
-        let mut cu = Vec::with_capacity(grid.iter().map(|v| v[0] as usize).sum::<usize>() + 1);
-        cu.push(0usize);
+        let mut cu = vec![0usize];
         let mut acc = 0usize;
-        for g in &grid {
-            let area = (g[1] * g[2]) as usize;
+        for (idx, g) in grid.iter().enumerate() {
+            let area = (g[1] as usize) * (g[2] as usize);
             for _ in 0..(g[0] as usize) {
-                acc += area;
+                let Some(next_acc) = acc.checked_add(area) else {
+                    candle::bail!("grid_thw row {idx} cumulative sequence length overflow");
+                };
+                acc = next_acc;
                 cu.push(acc);
             }
         }
@@ -558,6 +628,7 @@ impl Qwen3VLVisionModel {
     pub fn forward(&self, xs: &Tensor, grid_thw: &Tensor) -> Result<(Tensor, Vec<Tensor>)> {
         let dtype = self.pos_embed.embeddings().dtype();
         let xs = self.patch_embed.forward(&xs.to_dtype(dtype)?)?;
+        self.validate_grid_thw(grid_thw, Some(xs.dim(0)?))?;
         let pos_embeds = self.fast_pos_embed_interpolate(grid_thw)?;
         let mut hidden_states = xs.add(&pos_embeds)?;
 
@@ -581,5 +652,114 @@ impl Qwen3VLVisionModel {
 
         let hidden_states = self.merger.forward(&hidden_states)?;
         Ok((hidden_states, deepstack_features))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_vision_config() -> VisionConfig {
+        VisionConfig {
+            depth: 0,
+            hidden_size: 8,
+            out_hidden_size: 8,
+            hidden_act: Activation::Gelu,
+            intermediate_size: 16,
+            num_heads: 2,
+            in_chans: 3,
+            patch_size: 1,
+            spatial_merge_size: 2,
+            temporal_patch_size: 2,
+            num_position_embeddings: 4,
+            deepstack_visual_indexes: Vec::new(),
+        }
+    }
+
+    fn new_model(device: &Device) -> Result<Qwen3VLVisionModel> {
+        let vb = VarBuilder::zeros(DType::F32, device);
+        Qwen3VLVisionModel::new(&tiny_vision_config(), vb)
+    }
+
+    fn pixel_values(rows: usize, device: &Device) -> Result<Tensor> {
+        Tensor::zeros((rows, 6), DType::F32, device)
+    }
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vision_model_rejects_grid_with_too_few_columns() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let xs = pixel_values(4, &device)?;
+        let grid = Tensor::new(&[[1u32, 2]], &device)?;
+
+        assert_err_contains(model.forward(&xs, &grid), "grid_thw");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_grid_with_extra_columns() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let xs = pixel_values(4, &device)?;
+        let grid = Tensor::new(&[[1u32, 2, 2, 99]], &device)?;
+
+        assert_err_contains(model.forward(&xs, &grid), "grid_thw");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_grid_height_not_divisible_by_merge() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let xs = pixel_values(6, &device)?;
+        let grid = Tensor::new(&[[1u32, 3, 2]], &device)?;
+
+        assert_err_contains(model.forward(&xs, &grid), "grid_thw");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_grid_width_not_divisible_by_merge() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let xs = pixel_values(6, &device)?;
+        let grid = Tensor::new(&[[1u32, 2, 3]], &device)?;
+
+        assert_err_contains(model.forward(&xs, &grid), "grid_thw");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_pixel_grid_token_count_mismatch() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let xs = pixel_values(3, &device)?;
+        let grid = Tensor::new(&[[1u32, 2, 2]], &device)?;
+
+        assert_err_contains(model.forward(&xs, &grid), "grid_thw");
+        Ok(())
+    }
+
+    #[test]
+    fn vision_model_rejects_grid_area_overflow() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let grid = Tensor::new(&[[1u32, u32::MAX, u32::MAX]], &device)?;
+
+        assert_err_contains(model.build_cu_seqlens(&grid), "grid_thw");
+        Ok(())
     }
 }
