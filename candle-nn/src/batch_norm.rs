@@ -218,6 +218,12 @@ impl BatchNorm {
         // Flatten all the dimensions exception the channel one as this performs a Spatial Batch
         // Normalization.
         let x = x.flatten_from(1)?.contiguous()?;
+        let batch_size = x.dim(1)?;
+        if batch_size <= 1 {
+            candle::bail!(
+                "batch-norm training requires more than one value per channel, got {batch_size}"
+            )
+        }
         let x = if self.remove_mean {
             // The mean is taken over dim 1 as this is the batch dim after the transpose(0, 1) above.
             let mean_x = x.mean_keepdim(1)?;
@@ -231,7 +237,7 @@ impl BatchNorm {
         // The mean is taken over dim 1 as this is the batch dim after the transpose(0, 1) above.
         let norm_x = x.sqr()?.mean_keepdim(1)?;
         let updated_running_var = {
-            let batch_size = x.dim(1)? as f64;
+            let batch_size = batch_size as f64;
             let running_var_weight = 1.0 - self.momentum;
             let norm_x_weight = self.momentum * batch_size / (batch_size - 1.0);
             ((self.running_var.as_tensor() * running_var_weight)?

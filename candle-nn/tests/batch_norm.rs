@@ -106,10 +106,17 @@ fn train_batch_norm() -> Result<()> {
         test_utils::to_vec1_round(bn.running_mean(), 4)?,
         test_utils::to_vec1_round(var_map_mean.as_tensor(), 4)?,
     );
-    // Train with a something guaranteed to be different from the running mean.
+    // Train with values guaranteed to have a different mean from the running mean.
     let mean_plus_one = {
         let one = original_mean.ones_like()?;
-        original_mean.add(&one)?.reshape((1, 1))?
+        Tensor::cat(
+            &[
+                &original_mean.add(&one)?,
+                &original_mean.add(&(&one * 3.)?)?,
+            ],
+            0,
+        )?
+        .reshape((2, 1))?
     };
 
     bn.forward_train(&mean_plus_one)?;
@@ -124,5 +131,19 @@ fn train_batch_norm() -> Result<()> {
         test_utils::to_vec1_round(bn.running_mean(), 4)?,
         test_utils::to_vec1_round(var_map_mean.as_tensor(), 4)?,
     );
+    Ok(())
+}
+
+#[test]
+fn batch_norm_train_rejects_single_value_per_channel() -> Result<()> {
+    let running_mean = Tensor::zeros(1, DType::F32, &Device::Cpu)?;
+    let running_var = Tensor::ones(1, DType::F32, &Device::Cpu)?;
+    let bn = BatchNorm::new_no_bias(1, running_mean, running_var, 1e-5)?;
+    let input = Tensor::new(&[[1f32]], &Device::Cpu)?;
+
+    let err = bn.forward_train(&input).unwrap_err().to_string();
+    assert!(err.contains("more than one value per channel"));
+    assert_eq!(test_utils::to_vec1_round(bn.running_var(), 4)?, &[1f32]);
+
     Ok(())
 }
