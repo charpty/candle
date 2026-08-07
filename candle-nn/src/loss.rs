@@ -16,6 +16,9 @@ pub fn nll(inp: &Tensor, target: &Tensor) -> Result<Tensor> {
         &[b_sz] => b_sz,
         dims => candle::bail!("the target tensor should have a single dimension ({dims:?})"),
     };
+    if b_sz == 0 {
+        candle::bail!("the target tensor must not be empty")
+    }
     match inp.dims() {
         &[inp_b_sz, _] => {
             if inp_b_sz != b_sz {
@@ -39,8 +42,12 @@ pub fn nll(inp: &Tensor, target: &Tensor) -> Result<Tensor> {
 ///
 /// The resulting tensor is a scalar containing the average value over the batch.
 pub fn cross_entropy(inp: &Tensor, target: &Tensor) -> Result<Tensor> {
-    if inp.rank() != 2 {
-        candle::bail!("cross_entropy expects an input tensor of rank 2")
+    let b_sz = match inp.dims() {
+        &[b_sz, _] => b_sz,
+        _ => candle::bail!("cross_entropy expects an input tensor of rank 2"),
+    };
+    if b_sz == 0 {
+        candle::bail!("the target tensor must not be empty")
     }
     let inp = crate::ops::log_softmax(inp, 1)?;
     nll(&inp, target)
@@ -87,6 +94,9 @@ pub fn binary_cross_entropy_with_logit(inp: &Tensor, target: &Tensor) -> Result<
 /// delta(|x_n - y_n| - 0.5delta), & |x_n - y_n| >= delta
 /// ```
 pub fn huber(inp: &Tensor, target: &Tensor, delta: f64) -> Result<Tensor> {
+    if delta <= 0. {
+        candle::bail!("huber delta must be greater than zero, got {delta}")
+    }
     if inp.dims() != target.dims() {
         candle::bail!(
             "input and target must have the same shape, got inp: {:?}, target: {:?}",

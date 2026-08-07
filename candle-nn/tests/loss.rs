@@ -5,7 +5,7 @@ extern crate intel_mkl_src;
 extern crate accelerate_src;
 
 use candle::test_utils::to_vec0_round;
-use candle::{Device, Result, Tensor};
+use candle::{DType, Device, Result, Tensor};
 /* Equivalent python code:
 import torch
 import torch.nn.functional as F
@@ -36,6 +36,25 @@ fn nll_and_cross_entropy() -> Result<()> {
     assert_eq!(to_vec0_round(&loss, 4)?, 1.1312);
     let loss = candle_nn::loss::cross_entropy(&input, &target)?;
     assert_eq!(to_vec0_round(&loss, 4)?, 1.1312);
+    Ok(())
+}
+
+#[test]
+fn nll_and_cross_entropy_reject_empty_batch() -> Result<()> {
+    let cpu = Device::Cpu;
+    let input = Tensor::zeros((0, 5), DType::F32, &cpu)?;
+    let target = Tensor::zeros((0,), DType::U32, &cpu)?;
+
+    let err = candle_nn::loss::nll(&input, &target)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("must not be empty"), "{err}");
+
+    let err = candle_nn::loss::cross_entropy(&input, &target)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("must not be empty"), "{err}");
+
     Ok(())
 }
 
@@ -130,5 +149,23 @@ fn huber_loss() -> Result<()> {
     assert_eq!(to_vec0_round(&loss, 4)?, 0.4734);
     let loss = candle_nn::loss::huber(&inp, &target, 0.88)?;
     assert_eq!(to_vec0_round(&loss, 4)?, 0.4483);
+    Ok(())
+}
+
+#[test]
+fn huber_rejects_non_positive_delta() -> Result<()> {
+    let cpu = Device::Cpu;
+    let inp = Tensor::new(&[1f32, 2.], &cpu)?;
+    let target = Tensor::new(&[0f32, 0.], &cpu)?;
+
+    let err = candle_nn::loss::huber(&inp, &target, 0.)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("delta"));
+    let err = candle_nn::loss::huber(&inp, &target, -1.)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("delta"));
+
     Ok(())
 }
