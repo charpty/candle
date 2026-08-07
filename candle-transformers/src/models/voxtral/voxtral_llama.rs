@@ -456,8 +456,8 @@ impl VoxtralLlama {
         };
         let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
         let blocks: Vec<_> = (0..cfg.num_hidden_layers)
-            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), cfg).unwrap())
-            .collect();
+            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), cfg))
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             wte,
@@ -465,5 +465,52 @@ impl VoxtralLlama {
             ln_f,
             lm_head,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_config() -> VoxtralLlamaConfig {
+        VoxtralLlamaConfig {
+            hidden_size: 4,
+            intermediate_size: 8,
+            vocab_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: Some(2),
+            use_flash_attn: false,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            max_position_embeddings: 4,
+            tie_word_embeddings: false,
+        }
+    }
+
+    #[test]
+    fn load_returns_error_when_block_weights_are_missing() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = tiny_config();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.embed_tokens.weight".to_string(),
+            Tensor::zeros((cfg.vocab_size, cfg.hidden_size), DType::F32, &device)?,
+        );
+        tensors.insert(
+            "lm_head.weight".to_string(),
+            Tensor::zeros((cfg.vocab_size, cfg.hidden_size), DType::F32, &device)?,
+        );
+        tensors.insert(
+            "model.norm.weight".to_string(),
+            Tensor::ones(cfg.hidden_size, DType::F32, &device)?,
+        );
+
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let err = VoxtralLlama::load(vb, &cfg).unwrap_err().to_string();
+        assert!(err.contains("model.layers.0"));
+
+        Ok(())
     }
 }
