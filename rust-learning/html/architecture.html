@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：80 个 public API 边界</h2>
+          <h2>真实修复：86 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -303,6 +303,10 @@
           <article class="bug-card">
             <h3>BUG-075/080</h3>
             <p>Qwen3-VL forward 在入口校验 `seqlens`、`seqlen_offsets` 和 image/video placeholder span，避免 panic 和静默错合同。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-081/086</h3>
+            <p>Qwen3-VL vision 在插值和 reshape 前校验 `grid_thw` 列数、merge 整除关系、token 总数和 grid area 溢出。</p>
           </article>
           <article class="bug-card">
             <h3>审计方法</h3>

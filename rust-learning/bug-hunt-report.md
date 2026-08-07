@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：八十个 public API 边界修复
+# Candle bug hunt 报告：八十六个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复八十个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复八十六个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -12,7 +12,7 @@ Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 mul
 继续覆盖 Gemma4 multimodal/vision 的运行期数量和 pooling 边界；BUG-063 到 BUG-069 覆盖
 Qwen3-VL vision 构造期配置；BUG-070 到 BUG-074 覆盖 Qwen3-VL text attention 配置和空序列
 forward 边界；BUG-075 到 BUG-080 覆盖 Qwen3-VL 外层 forward 的 per-batch 元数据和 image/video
-placeholder span 合同。
+placeholder span 合同；BUG-081 到 BUG-086 覆盖 Qwen3-VL vision runtime `grid_thw` 合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -103,6 +103,12 @@ placeholder span 合同。
 | BUG-078 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `seqlens.len() != batch_size` 被静默接受，per-batch 元数据和输入 batch 脱节 | 要求 seqlens 数量匹配 batch |
 | BUG-079 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | image placeholder span `start > end` 在 `end - start` 处下溢 panic | 计算长度前校验 image span 顺序和范围 |
 | BUG-080 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | video placeholder span `start > end` 在 `end - start` 处下溢 panic | 计算长度前校验 video span 顺序和范围 |
+| BUG-081 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `grid_thw` 只有两列时直接访问 `g[2]` panic | 要求 `grid_thw` shape 为 `[N, 3]` |
+| BUG-082 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `grid_thw` 多于三列时额外列被静默忽略 | 同样用 `[N, 3]` 精确 shape 校验拒绝额外列 |
+| BUG-083 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | grid height 不能被 `spatial_merge_size` 整除时延迟成 reshape 错误 | 插值/reshape 前校验 height 整除关系 |
+| BUG-084 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | grid width 不能被 `spatial_merge_size` 整除时延迟成 reshape 错误 | 插值/reshape 前校验 width 整除关系 |
+| BUG-085 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | pixel token 行数和 `grid_thw` 派生 token 数不一致时只得到 add shape mismatch | forward 入口校验二者 token count 一致 |
+| BUG-086 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `h * w` 用 `u32` 乘法，超大 grid 在 debug 下溢出 panic | 使用 checked arithmetic 并返回 `Err` |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -1862,7 +1868,77 @@ git diff --check
 - `agent/bug-079-qwen3-vl-reversed-image-span`
 - `agent/bug-080-qwen3-vl-reversed-video-span`
 
-## 八十个案例教什么
+## BUG-081 到 BUG-086：Qwen3-VL vision runtime grid 合同
+
+受影响文件：
+
+- [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs)
+
+`Qwen3VLVisionModel::forward` 的核心输入不是只有 `pixel_values`，还有 `grid_thw`。这个 tensor
+描述每个视觉样本的 temporal、height、width grid，它会同时影响：
+
+- positional embedding 插值。
+- rotary position embedding 坐标生成。
+- attention 的 cumulative sequence lengths。
+- patch merger 的 reshape 分组。
+
+原实现直接把 `grid_thw` 转成 `Vec<Vec<u32>>`，然后假设每行至少三列：
+
+```rust
+let grid = grid_thw.to_vec2::<u32>()?;
+let h = g[1] as usize;
+let w = g[2] as usize;
+let area = (g[1] * g[2]) as usize;
+```
+
+这些假设没有在入口证明，就会出现两类问题：短列 panic，长列静默忽略；不满足 merge 的 grid
+延迟到 reshape 才报错；超大 `h * w` 在 debug 构建下直接整数溢出 panic。
+
+修复前 6 个测试的失败形态：
+
+- `[1, 2]` 两列 grid：访问 `g[2]` 时 index out of bounds。
+- `[1, 2, 2, 99]` 四列 grid：模型返回 `Ok`，第 4 列被完全忽略。
+- `h = 3, spatial_merge_size = 2`：最终得到 `shape mismatch in reshape`。
+- `w = 3, spatial_merge_size = 2`：同样延迟成 reshape 错误。
+- pixel rows 为 3、`grid_thw = [1,2,2]` 派生 token 数为 4：只得到 `shape mismatch in add`。
+- `h = u32::MAX, w = u32::MAX`：`g[1] * g[2]` 溢出 panic。
+
+修复策略：
+
+1. 新增 `validate_grid_thw`，要求 `grid_thw` 是精确 `[N, 3]`，既不短也不多。
+2. 拒绝空 grid row、`t/h/w = 0`、`spatial_merge_size = 0`。
+3. 要求 `h` 和 `w` 都能被 `spatial_merge_size` 整除。
+4. 用 checked arithmetic 计算每行 area、每行 token 数和总 token 数。
+5. 在 `forward` 中用 `xs.dim(0)` 校验 pixel token 行数必须等于 `grid_thw` 派生 token 总数。
+6. `build_cu_seqlens` 自己也调用同一个校验，避免后续维护者绕过 public forward 时重新引入溢出。
+
+新增测试：
+
+- `vision_model_rejects_grid_with_too_few_columns`
+- `vision_model_rejects_grid_with_extra_columns`
+- `vision_model_rejects_grid_height_not_divisible_by_merge`
+- `vision_model_rejects_grid_width_not_divisible_by_merge`
+- `vision_model_rejects_pixel_grid_token_count_mismatch`
+- `vision_model_rejects_grid_area_overflow`
+
+修复后验证：
+
+```bash
+cargo test -p candle-transformers models::qwen3_vl::vision::tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-081-qwen3-vl-grid-too-few-columns`
+- `agent/bug-082-qwen3-vl-grid-extra-columns`
+- `agent/bug-083-qwen3-vl-grid-height-merge`
+- `agent/bug-084-qwen3-vl-grid-width-merge`
+- `agent/bug-085-qwen3-vl-grid-token-count`
+- `agent/bug-086-qwen3-vl-grid-area-overflow`
+
+## 八十六个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
