@@ -12,6 +12,19 @@ use candle_nn::{embedding, linear_b, rms_norm, Embedding, Linear, Module, RmsNor
 
 use super::config::TextConfig;
 
+fn validate_image_grid(grid_h: usize, grid_w: usize) -> Result<usize> {
+    if grid_h == 0 {
+        candle::bail!("grid_h must be greater than zero");
+    }
+    if grid_w == 0 {
+        candle::bail!("grid_w must be greater than zero");
+    }
+    let Some(num_tokens) = grid_h.checked_mul(grid_w) else {
+        candle::bail!("image grid token count overflows usize");
+    };
+    Ok(num_tokens)
+}
+
 /// Multimodal Rotary Position Embedding (M-RoPE).
 ///
 /// Unlike standard 1D RoPE, M-RoPE supports 3D position IDs for vision tokens:
@@ -60,6 +73,28 @@ impl RotaryEmbedding {
         })
     }
 
+    fn validate_position_ids(&self, q: &Tensor, k: &Tensor, position_ids: &Tensor) -> Result<()> {
+        let (q_batch, _q_heads, q_seq_len, q_head_dim) = q.dims4()?;
+        let (k_batch, _k_heads, k_seq_len, k_head_dim) = k.dims4()?;
+        if q_batch != k_batch {
+            candle::bail!("q batch ({q_batch}) must match k batch ({k_batch})");
+        }
+        if q_seq_len != k_seq_len {
+            candle::bail!("q seq_len ({q_seq_len}) must match k seq_len ({k_seq_len})");
+        }
+        if q_head_dim != self.head_dim || k_head_dim != self.head_dim {
+            candle::bail!(
+                "q/k head_dim ({q_head_dim}/{k_head_dim}) must match rotary head_dim ({})",
+                self.head_dim
+            );
+        }
+        let dims = position_ids.dims();
+        if dims != [3, q_batch, q_seq_len] {
+            candle::bail!("position_ids must have shape [3, {q_batch}, {q_seq_len}], got {dims:?}");
+        }
+        Ok(())
+    }
+
     /// Apply Multimodal RoPE with 3D position IDs.
     ///
     /// This follows the PyTorch implementation where:
@@ -77,9 +112,7 @@ impl RotaryEmbedding {
         k: &Tensor,
         position_ids: &Tensor,
     ) -> Result<(Tensor, Tensor)> {
-        // position_ids: [3, batch, seq_len]
-        let (three, _batch, _seq_len) = position_ids.dims3()?;
-        assert_eq!(three, 3, "position_ids must have 3 dimensions");
+        self.validate_position_ids(q, k, position_ids)?;
 
         // Compute cos/sin for each position dimension
         // Each returns [batch, seq_len, head_dim] with cos/sin of (inv_freq * position)
@@ -218,8 +251,7 @@ impl RotaryEmbedding {
         use std::collections::HashMap;
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
 
-        let (three, _batch, _seq_len) = position_ids.dims3()?;
-        assert_eq!(three, 3, "position_ids must have 3 dimensions");
+        self.validate_position_ids(q, k, position_ids)?;
 
         // Export position_ids
         tensors.insert("position_ids".to_string(), position_ids.clone());
@@ -428,6 +460,7 @@ pub fn compute_mrope_position_ids(
 ) -> Result<Tensor> {
     let (batch, seq_len) = input_ids.dims2()?;
     let input_ids_vec: Vec<u32> = input_ids.flatten_all()?.to_vec1()?;
+    let num_vision_tokens = validate_image_grid(grid_h, grid_w)?;
 
     // Create position IDs for all 3 dimensions
     let mut pos_t = vec![0i64; batch * seq_len];
@@ -435,21 +468,23 @@ pub fn compute_mrope_position_ids(
     let mut pos_w = vec![0i64; batch * seq_len];
 
     for b in 0..batch {
-        // Find the first image token position
         let batch_start = b * seq_len;
-        let mut first_image_pos = None;
-        for s in 0..seq_len {
-            if input_ids_vec[batch_start + s] == image_token_id {
-                first_image_pos = Some(s);
-                break;
-            }
+        let image_positions: Vec<usize> = (0..seq_len)
+            .filter(|&s| input_ids_vec[batch_start + s] == image_token_id)
+            .collect();
+        if image_positions.len() != num_vision_tokens {
+            candle::bail!(
+                "Image token count ({}) must match grid {grid_h}x{grid_w} = {num_vision_tokens}",
+                image_positions.len()
+            );
         }
-
-        // Compute positions following PyTorch's algorithm
-        let num_vision_tokens = grid_h * grid_w;
+        if image_positions.windows(2).any(|w| w[1] != w[0] + 1) {
+            candle::bail!("Image tokens must be contiguous");
+        }
+        let first_image_pos = image_positions[0];
 
         // Text tokens before vision get sequential positions
-        let text_before = first_image_pos.unwrap_or(seq_len);
+        let text_before = first_image_pos;
         for s in 0..text_before {
             let idx = batch_start + s;
             pos_t[idx] = s as i64;
@@ -1256,5 +1291,166 @@ impl TextModel {
         tensors.insert("logits".to_string(), logits.clone());
 
         Ok((logits, tensors))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::Activation;
+
+    fn tiny_text_config() -> TextConfig {
+        TextConfig {
+            vocab_size: 8,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 0,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            hidden_act: Activation::Silu,
+            max_position_embeddings: 16,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            head_dim: 4,
+            use_bias: false,
+            tie_word_embeddings: true,
+            mrope_section: vec![1, 1, 0],
+        }
+    }
+
+    fn rotary_embedding() -> Result<RotaryEmbedding> {
+        RotaryEmbedding::new(&tiny_text_config(), &Device::Cpu, DType::F32)
+    }
+
+    fn qk() -> Result<(Tensor, Tensor)> {
+        let q = Tensor::zeros((1, 2, 2, 4), DType::F32, &Device::Cpu)?;
+        let k = Tensor::zeros((1, 2, 2, 4), DType::F32, &Device::Cpu)?;
+        Ok((q, k))
+    }
+
+    fn position_ids(shape: (usize, usize, usize)) -> Result<Tensor> {
+        Tensor::zeros(shape, DType::I64, &Device::Cpu)
+    }
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rotary_embedding_rejects_position_ids_with_wrong_first_dim() -> Result<()> {
+        let rotary = rotary_embedding()?;
+        let (q, k) = qk()?;
+        let position_ids = position_ids((2, 1, 2))?;
+        assert_err_contains(
+            rotary.apply_multimodal_rotary_emb(&q, &k, &position_ids),
+            "position_ids",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotary_embedding_export_rejects_position_ids_with_wrong_first_dim() -> Result<()> {
+        let rotary = rotary_embedding()?;
+        let (q, k) = qk()?;
+        let position_ids = position_ids((2, 1, 2))?;
+        assert_err_contains(
+            rotary.apply_multimodal_rotary_emb_with_export(&q, &k, &position_ids),
+            "position_ids",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotary_embedding_rejects_position_ids_batch_mismatch() -> Result<()> {
+        let rotary = rotary_embedding()?;
+        let (q, k) = qk()?;
+        let position_ids = position_ids((3, 2, 2))?;
+        assert_err_contains(
+            rotary.apply_multimodal_rotary_emb(&q, &k, &position_ids),
+            "position_ids",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rotary_embedding_rejects_position_ids_seq_len_mismatch() -> Result<()> {
+        let rotary = rotary_embedding()?;
+        let (q, k) = qk()?;
+        let position_ids = position_ids((3, 1, 3))?;
+        assert_err_contains(
+            rotary.apply_multimodal_rotary_emb(&q, &k, &position_ids),
+            "position_ids",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_rejects_zero_grid_height() -> Result<()> {
+        let input_ids = Tensor::new(&[[1u32, 99, 2]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids(&input_ids, 99, 0, 1, &Device::Cpu),
+            "grid_h",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_rejects_zero_grid_width() -> Result<()> {
+        let input_ids = Tensor::new(&[[1u32, 99, 2]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids(&input_ids, 99, 1, 0, &Device::Cpu),
+            "grid_w",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_rejects_too_few_image_tokens() -> Result<()> {
+        let input_ids = Tensor::new(&[[1u32, 99, 2]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids(&input_ids, 99, 1, 2, &Device::Cpu),
+            "Image token count",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_rejects_too_many_image_tokens() -> Result<()> {
+        let input_ids = Tensor::new(&[[1u32, 99, 99, 2]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids(&input_ids, 99, 1, 1, &Device::Cpu),
+            "Image token count",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_rejects_non_contiguous_image_tokens() -> Result<()> {
+        let input_ids = Tensor::new(&[[99u32, 1, 99]], &Device::Cpu)?;
+        assert_err_contains(
+            compute_mrope_position_ids(&input_ids, 99, 1, 2, &Device::Cpu),
+            "contiguous",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compute_mrope_position_ids_accepts_contiguous_image_tokens() -> Result<()> {
+        let input_ids = Tensor::new(&[[1u32, 99, 99, 2]], &Device::Cpu)?;
+        let position_ids = compute_mrope_position_ids(&input_ids, 99, 1, 2, &Device::Cpu)?;
+        assert_eq!(position_ids.dims(), &[3, 1, 4]);
+        assert_eq!(position_ids.i(0)?.to_vec2::<i64>()?, vec![vec![0, 1, 1, 3]]);
+        assert_eq!(position_ids.i(1)?.to_vec2::<i64>()?, vec![vec![0, 1, 1, 3]]);
+        assert_eq!(position_ids.i(2)?.to_vec2::<i64>()?, vec![vec![0, 1, 2, 3]]);
+        Ok(())
     }
 }
