@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：56 个 public API 边界</h2>
+          <h2>真实修复：59 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -283,6 +283,10 @@
           <article class="bug-card">
             <h3>BUG-054/056</h3>
             <p>Gemma4 multimodal embedding 按 mask true 位置顺序放置，支持多 batch，并拒绝 embedding/token 数量不一致。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-057/059</h3>
+            <p>Gemma4 audio forward 拒绝 mask batch/time 隐式广播和空 time 维，让音频输入合同在入口闭合。</p>
           </article>
           <article class="bug-card">
             <h3>审计方法</h3>

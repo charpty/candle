@@ -1,14 +1,14 @@
-# Candle bug hunt 报告：五十六个 public API 边界修复
+# Candle bug hunt 报告：五十九个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复五十六个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复五十九个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
-和 mask 对齐语义。
+和 mask 对齐语义；BUG-057 到 BUG-059 覆盖 Gemma4 audio forward 输入合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -75,6 +75,9 @@ Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 mul
 | BUG-054 | [candle-transformers/src/models/gemma4/mod.rs](../candle-transformers/src/models/gemma4/mod.rs) | 单 batch multimodal embeddings 从序列开头铺开，mask 在后面时会取错或取 0 | 按 mask true 位置顺序 gather embeddings |
 | BUG-055 | [candle-transformers/src/models/gemma4/mod.rs](../candle-transformers/src/models/gemma4/mod.rs) | 多 batch multimodal embedding helper 直接返回全 0 | 支持 row-major 跨 batch 放置 |
 | BUG-056 | [candle-transformers/src/models/gemma4/mod.rs](../candle-transformers/src/models/gemma4/mod.rs) | embedding 数量和 mask token 数不一致时静默 pad/truncate | 数量不一致直接返回错误 |
+| BUG-057 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | `audio_mel_mask` batch 为 1 时可广播到多个 audio batch | forward 要求 mask batch 精确匹配 audio batch |
+| BUG-058 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | `audio_mel_mask` time 为 1 时可广播到多个 audio frame | forward 要求 mask time 精确匹配 audio time |
+| BUG-059 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | 空 audio time 维会进入后续 conv/subsample 边界 | forward 入口拒绝空 time |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -1510,7 +1513,49 @@ cargo test -p candle-transformers models::gemma4::tests
 - `agent/bug-055-gemma4-multi-batch-embed-placement`
 - `agent/bug-056-gemma4-embed-mask-count-mismatch`
 
-## 五十六个案例教什么
+## BUG-057 到 BUG-059：Gemma4 audio forward 输入合同
+
+受影响文件：
+
+- [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs)
+
+`AudioModel::forward` 的文档合同是：
+
+```text
+audio_mel      : [batch, time, mel_bins]
+audio_mel_mask : [batch, time]
+```
+
+这两个 batch/time 维不能利用 Tensor 广播规则。mask 的语义是一帧一位，如果 mask batch 或 time
+为 1 被广播到更大的 audio tensor，就会把一条 mask 错套到多个样本或多个 frame 上。
+
+修复策略是在 public forward 第一行校验：
+
+- `audio_mel` 是 3D。
+- `audio_mel_mask` 是 2D。
+- time 维非空。
+- mask batch 等于 audio batch。
+- mask time 等于 audio time。
+
+新增测试：
+
+- `audio_model_rejects_mask_batch_mismatch`
+- `audio_model_rejects_mask_time_mismatch`
+- `audio_model_rejects_empty_time_dimension`
+
+已运行：
+
+```bash
+cargo test -p candle-transformers models::gemma4::audio::tests
+```
+
+分支：
+
+- `agent/bug-057-gemma4-audio-mask-batch-broadcast`
+- `agent/bug-058-gemma4-audio-mask-time-broadcast`
+- `agent/bug-059-gemma4-audio-empty-time-input`
+
+## 五十九个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
