@@ -8,6 +8,25 @@ use candle_nn::{Conv1d, Conv2d, Conv2dConfig, VarBuilder};
 
 use super::config::Gemma4AudioConfig;
 
+fn validate_audio_forward_inputs(audio_mel: &Tensor, audio_mel_mask: &Tensor) -> Result<()> {
+    let (batch_size, time_steps, _) = audio_mel.dims3()?;
+    let (mask_batch_size, mask_time_steps) = audio_mel_mask.dims2()?;
+    if time_steps == 0 {
+        candle::bail!("audio_mel time dimension must be greater than zero")
+    }
+    if mask_batch_size != batch_size {
+        candle::bail!(
+            "audio_mel_mask batch size must match audio_mel batch size, got mask batch {mask_batch_size} and audio batch {batch_size}"
+        )
+    }
+    if mask_time_steps != time_steps {
+        candle::bail!(
+            "audio_mel_mask time dimension must match audio_mel time dimension, got mask time {mask_time_steps} and audio time {time_steps}"
+        )
+    }
+    Ok(())
+}
+
 // ── RmsNorm (standard, no +1 offset for audio) ─────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -842,6 +861,7 @@ impl AudioModel {
     }
 
     pub fn forward(&self, audio_mel: &Tensor, audio_mel_mask: &Tensor) -> Result<(Tensor, Tensor)> {
+        validate_audio_forward_inputs(audio_mel, audio_mel_mask)?;
         let (mut audio_encodings, mut current_mask) = self
             .subsample_conv_projection
             .forward(audio_mel, audio_mel_mask)?;
@@ -887,5 +907,90 @@ impl AudioModel {
             .where_cond(&audio_encodings, &zeros)?;
 
         Ok((audio_encodings, current_mask))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_config() -> Gemma4AudioConfig {
+        Gemma4AudioConfig {
+            input_feat_size: 8,
+            hidden_size: 4,
+            output_proj_dims: None,
+            conf_attention_chunk_size: 2,
+            conf_attention_context_left: 1,
+            conf_attention_context_right: 0,
+            conf_attention_invalid_logits_value: -1e9,
+            conf_attention_logit_cap: 50.0,
+            conf_num_attention_heads: 2,
+            conf_num_hidden_layers: 0,
+            conf_conv_kernel_size: 3,
+            conf_reduction_factor: 1,
+            conf_residual_weight: 0.5,
+            sscp_conv_channel_size: vec![2, 2],
+            sscp_conv_kernel_size: vec![vec![3, 3], vec![3, 3]],
+            sscp_conv_stride_size: vec![vec![2, 2], vec![2, 2]],
+            vocab_size: 8,
+            sscp_conv_group_norm_eps: 1e-6,
+            sscp_conv_eps: 1e-3,
+            rms_norm_eps: 1e-6,
+            gradient_clipping: 1e10,
+        }
+    }
+
+    fn tiny_model(device: &candle::Device) -> Result<AudioModel> {
+        AudioModel::new(
+            &tiny_config(),
+            VarBuilder::zeros(DType::F32, device).pp("audio"),
+        )
+    }
+
+    fn assert_err_contains<T: std::fmt::Debug>(result: Result<T>, expected: &str) {
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(expected),
+            "expected error containing {expected:?}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn audio_model_rejects_mask_batch_mismatch() -> Result<()> {
+        let device = candle::Device::Cpu;
+        let model = tiny_model(&device)?;
+        let audio_mel = Tensor::zeros((2, 4, 8), DType::F32, &device)?;
+        let mask = Tensor::zeros((1, 4), DType::F32, &device)?;
+        assert_err_contains(
+            model.forward(&audio_mel, &mask),
+            "audio_mel_mask batch size must match",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn audio_model_rejects_mask_time_mismatch() -> Result<()> {
+        let device = candle::Device::Cpu;
+        let model = tiny_model(&device)?;
+        let audio_mel = Tensor::zeros((1, 4, 8), DType::F32, &device)?;
+        let mask = Tensor::zeros((1, 1), DType::F32, &device)?;
+        assert_err_contains(
+            model.forward(&audio_mel, &mask),
+            "audio_mel_mask time dimension must match",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn audio_model_rejects_empty_time_dimension() -> Result<()> {
+        let device = candle::Device::Cpu;
+        let model = tiny_model(&device)?;
+        let audio_mel = Tensor::zeros((1, 0, 8), DType::F32, &device)?;
+        let mask = Tensor::zeros((1, 0), DType::F32, &device)?;
+        assert_err_contains(
+            model.forward(&audio_mel, &mask),
+            "audio_mel time dimension must be greater than zero",
+        );
+        Ok(())
     }
 }
