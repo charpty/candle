@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百一十六个 public API 边界修复
+# Candle bug hunt 报告：一百二十四个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百一十六个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百二十四个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -16,6 +16,7 @@ placeholder span 合同；BUG-081 到 BUG-086 覆盖 Qwen3-VL vision runtime `gr
 BUG-087 到 BUG-092 覆盖 PaddleOCR-VL vision 构造期配置；BUG-093 到 BUG-097 覆盖
 PaddleOCR-VL text attention 配置和空序列 forward 合同；BUG-098 到 BUG-107 覆盖 PaddleOCR-VL
 vision runtime `grid_thw` 合同；BUG-108 到 BUG-116 覆盖 PaddleOCR-VL text M-RoPE 运行期输入合同。
+BUG-117 到 BUG-124 覆盖 PaddleOCR-VL video M-RoPE 运行期输入合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -142,6 +143,14 @@ vision runtime `grid_thw` 合同；BUG-108 到 BUG-116 覆盖 PaddleOCR-VL text 
 | BUG-114 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | image token 少于 `grid_h * grid_w` 时 helper 仍返回 Ok | 要求 image token 数等于 grid 面积 |
 | BUG-115 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | image token 多于 `grid_h * grid_w` 时多余 token 被当成文本 | 同样校验 token count |
 | BUG-116 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | image token 非连续时仍被按同一图像位置编码 | 要求 image token span 连续 |
+| BUG-117 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | video M-RoPE `grid_t = 0` 被接受，返回文本式位置 | 拒绝零 temporal grid |
+| BUG-118 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | video M-RoPE `grid_h = 0` 被接受 | 拒绝零 video grid height |
+| BUG-119 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | video M-RoPE `grid_w = 0` 被接受 | 拒绝零 video grid width |
+| BUG-120 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `tokens_per_second = 0` 让 temporal scaling 失去语义 | 要求 tokens_per_second 大于 0 |
+| BUG-121 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `second_per_grid_t = 0` 让不同 frame temporal position 重合 | 要求 second_per_grid_t 大于 0 |
+| BUG-122 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | negative `second_per_grid_t` 会生成负 temporal position | 要求 second_per_grid_t 为正数 |
+| BUG-123 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | non-finite `second_per_grid_t` 被 cast 成整数位置 | 要求 second_per_grid_t 有限 |
+| BUG-124 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | 额外非连续 video token 被当成文本 token | 统计全序列 video token，要求数量和 span 连续 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2226,7 +2235,65 @@ git diff --check
 - `agent/bug-115-paddleocr-vl-mrope-too-many-image-tokens`
 - `agent/bug-116-paddleocr-vl-mrope-non-contiguous-image-tokens`
 
-## 一百一十六个案例教什么
+## BUG-117 到 BUG-124：PaddleOCR-VL video M-RoPE 输入合同
+
+受影响文件：
+
+- [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs)
+
+video 版 M-RoPE 比 image 版多两个合同：video grid 有 temporal 维，且 temporal position 还依赖
+`second_per_grid_t * tokens_per_second`。这两个参数如果为 0、负数或非有限值，最终生成的
+position id 会让不同 frame 重合、倒退，或把 NaN/Inf cast 成整数。
+
+修复前 8 个测试的失败形态：
+
+- `grid_t = 0`、`grid_h = 0`、`grid_w = 0`：helper 返回 `Ok`，没有拒绝无效 video grid。
+- `tokens_per_second = 0`：temporal scaling 失去语义，仍返回 `Ok`。
+- `second_per_grid_t = 0`：不同 frame 的 temporal position 重合，仍返回 `Ok`。
+- negative `second_per_grid_t`：会生成负 temporal position，仍返回 `Ok`。
+- NaN `second_per_grid_t`：会被 cast 成整数位置，仍返回 `Ok`。
+- 输入 `[video, text, video]`、grid 只期望 1 个 video token：第二个 video token 被当成 text token 编码。
+
+修复策略：
+
+1. 新增 `validate_video_grid`，拒绝零 temporal/height/width grid。
+2. 要求 `second_per_grid_t` finite 且大于 0，要求 `tokens_per_second > 0`。
+3. 用 checked arithmetic 计算 spatial token 数和总 video token 数。
+4. 对每个 batch 收集全序列 video token 位置，要求数量等于 grid token 数且连续。
+5. 补正向测试，确认连续 2-frame video token 的 temporal/height/width position 仍符合原设计。
+
+新增测试：
+
+- `compute_mrope_position_ids_video_rejects_zero_grid_t`
+- `compute_mrope_position_ids_video_rejects_zero_grid_h`
+- `compute_mrope_position_ids_video_rejects_zero_grid_w`
+- `compute_mrope_position_ids_video_rejects_zero_tokens_per_second`
+- `compute_mrope_position_ids_video_rejects_zero_seconds_per_grid_t`
+- `compute_mrope_position_ids_video_rejects_negative_seconds_per_grid_t`
+- `compute_mrope_position_ids_video_rejects_non_finite_seconds_per_grid_t`
+- `compute_mrope_position_ids_video_rejects_extra_non_contiguous_video_tokens`
+- `compute_mrope_position_ids_video_accepts_contiguous_video_tokens`
+
+修复后验证：
+
+```bash
+cargo test -p candle-transformers models::paddleocr_vl::text::tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-117-paddleocr-vl-video-zero-grid-t`
+- `agent/bug-118-paddleocr-vl-video-zero-grid-h`
+- `agent/bug-119-paddleocr-vl-video-zero-grid-w`
+- `agent/bug-120-paddleocr-vl-video-zero-tokens-per-second`
+- `agent/bug-121-paddleocr-vl-video-zero-seconds-per-grid-t`
+- `agent/bug-122-paddleocr-vl-video-negative-seconds-per-grid-t`
+- `agent/bug-123-paddleocr-vl-video-nonfinite-seconds-per-grid-t`
+- `agent/bug-124-paddleocr-vl-video-extra-token-span`
+
+## 一百二十四个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
