@@ -947,15 +947,45 @@ pub fn layer_norm(xs: &Tensor, alpha: &Tensor, beta: &Tensor, eps: f32) -> Resul
 // https://pytorch.org/docs/stable/generated/torch.nn.PixelShuffle.html
 pub fn pixel_shuffle(xs: &Tensor, upscale_factor: usize) -> Result<Tensor> {
     let (b_size, c, h, w) = xs.dims4()?;
-    let out_c = c / upscale_factor / upscale_factor;
+    if upscale_factor == 0 {
+        candle::bail!("pixel_shuffle upscale_factor must be greater than zero")
+    }
+    let Some(factor_sq) = upscale_factor.checked_mul(upscale_factor) else {
+        candle::bail!("pixel_shuffle upscale_factor is too large: {upscale_factor}")
+    };
+    if c % factor_sq != 0 {
+        candle::bail!(
+            "pixel_shuffle channel dimension must be divisible by upscale_factor squared, got channels {c} and upscale_factor {upscale_factor}"
+        )
+    }
+    let Some(out_h) = h.checked_mul(upscale_factor) else {
+        candle::bail!("pixel_shuffle output height would overflow")
+    };
+    let Some(out_w) = w.checked_mul(upscale_factor) else {
+        candle::bail!("pixel_shuffle output width would overflow")
+    };
+    let out_c = c / factor_sq;
     xs.reshape((b_size, out_c, upscale_factor, upscale_factor, h, w))?
         .permute((0, 1, 4, 2, 5, 3))?
-        .reshape((b_size, out_c, h * upscale_factor, w * upscale_factor))
+        .reshape((b_size, out_c, out_h, out_w))
 }
 
 pub fn pixel_unshuffle(xs: &Tensor, downscale_factor: usize) -> Result<Tensor> {
     let (b_size, c, h, w) = xs.dims4()?;
-    let out_c = c * downscale_factor * downscale_factor;
+    if downscale_factor == 0 {
+        candle::bail!("pixel_unshuffle downscale_factor must be greater than zero")
+    }
+    if h % downscale_factor != 0 || w % downscale_factor != 0 {
+        candle::bail!(
+            "pixel_unshuffle spatial dimensions must be divisible by downscale_factor, got height {h}, width {w}, and downscale_factor {downscale_factor}"
+        )
+    }
+    let Some(factor_sq) = downscale_factor.checked_mul(downscale_factor) else {
+        candle::bail!("pixel_unshuffle downscale_factor is too large: {downscale_factor}")
+    };
+    let Some(out_c) = c.checked_mul(factor_sq) else {
+        candle::bail!("pixel_unshuffle output channel dimension would overflow")
+    };
     xs.reshape((
         b_size,
         c,
@@ -970,17 +1000,37 @@ pub fn pixel_unshuffle(xs: &Tensor, downscale_factor: usize) -> Result<Tensor> {
 
 // https://pytorch.org/docs/stable/generated/torch.nn.ReplicationPad2d.html
 pub fn replication_pad2d(xs: &Tensor, pad: usize) -> Result<Tensor> {
-    match pad {
-        0 => Ok(xs.clone()),
-        1 => {
-            let (_b_size, _c, h, w) = xs.dims4()?;
-            let (first, last) = (xs.narrow(3, 0, 1)?, xs.narrow(3, w - 1, 1)?);
-            let xs = Tensor::cat(&[&first, xs, &last], 3)?;
-            let (first, last) = (xs.narrow(2, 0, 1)?, xs.narrow(2, h - 1, 1)?);
-            Tensor::cat(&[&first, &xs, &last], 2)
-        }
-        n => candle::bail!("replication-pad with a size of {n} is not supported"),
+    if pad == 0 {
+        return Ok(xs.clone());
     }
+    let (_b_size, _c, h, w) = xs.dims4()?;
+    if h == 0 || w == 0 {
+        candle::bail!("cannot use replication_pad2d on an empty spatial dimension")
+    }
+
+    let left = xs.narrow(3, 0, 1)?;
+    let right = xs.narrow(3, w - 1, 1)?;
+    let mut cols = Vec::with_capacity(2 * pad + 1);
+    for _ in 0..pad {
+        cols.push(&left);
+    }
+    cols.push(xs);
+    for _ in 0..pad {
+        cols.push(&right);
+    }
+    let xs = Tensor::cat(&cols, 3)?;
+
+    let top = xs.narrow(2, 0, 1)?;
+    let bottom = xs.narrow(2, h - 1, 1)?;
+    let mut rows = Vec::with_capacity(2 * pad + 1);
+    for _ in 0..pad {
+        rows.push(&top);
+    }
+    rows.push(&xs);
+    for _ in 0..pad {
+        rows.push(&bottom);
+    }
+    Tensor::cat(&rows, 2)
 }
 
 #[derive(Clone, Debug)]

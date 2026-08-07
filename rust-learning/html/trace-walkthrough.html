@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>一次生成全链路拆解</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Trace Walkthrough</p>
+        <h1>一次生成全链路拆解</h1>
+      </div>
+      <nav aria-label="页面导航">
+        <a href="./index.html">链路站</a>
+        <a href="./architecture.html">架构</a>
+        <a href="./course-syllabus.html">大纲</a>
+        <a href="#transcript">输出</a>
+        <a href="#invariants">不变量</a>
+        <a href="#drills">练习</a>
+      </nav>
+    </header>
+
+    <main class="document-page">
+      <section class="panel-section lead-panel">
+        <div class="section-heading">
+          <p class="eyebrow">Lesson Goal</p>
+          <h2>把 stdout 读成系统设计图</h2>
+        </div>
+        <p>
+          这节课只看一次 tiny tour 的输出。目标不是背 API，而是把每一行 stdout 翻译成
+          Rust 所有权、Tensor shape/dtype、KV Cache 和停止条件的不变量。
+        </p>
+        <div class="command-row">
+          <pre><code>cargo run -p candle-examples --example rust-candle-tour -- --cpu --trace-shapes -n 1</code></pre>
+          <pre><code>cargo run -p candle-examples --example rust-candle-tour -- --cpu --compare-cache --eos-token 22 -n 8</code></pre>
+        </div>
+      </section>
+
+      <section id="transcript" class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Transcript</p>
+          <h2>prefill 第一轮输出</h2>
+        </div>
+        <div class="transcript-grid">
+          <pre class="terminal"><code>device: Cpu
+prompt token ids: [1, 5, 9, 2]
+generation:
+  cached prefill: index_pos=0 context_size=4 input_shape=[1, 4]
+    token ids [B,S]        shape=[1, 4] dtype=U32
+    embedding [B,S,H]      shape=[1, 4, 16] dtype=F32
+    attn input [B,S,H]     shape=[1, 4, 16] dtype=F32
+    q [B,N,S,D]            shape=[1, 4, 4, 4] dtype=F32
+    k cache [B,N,T,D]      shape=[1, 4, 4, 4] dtype=F32
+    scores [B,N,S,T]       shape=[1, 4, 4, 4] dtype=F32
+    logits [B,V]           shape=[1, 32] dtype=F32
+  cached step=00 input=[1, 5, 9, 2] -> token=23 cache_len=4
+all token ids: [1, 5, 9, 2, 23]</code></pre>
+
+          <div class="callouts">
+            <article>
+              <h3>先看阶段</h3>
+              <p>`cached prefill` 表示第一轮吃完整 prompt。`context_size=4` 来自 prompt 长度。</p>
+            </article>
+            <article>
+              <h3>再看 dtype</h3>
+              <p>token ids 是整数，Embedding 输出后进入浮点世界，logits 采样前保持 F32。</p>
+            </article>
+            <article>
+              <h3>最后看 cache</h3>
+              <p>prefill 后 cache_len 是 4，和 scores 的最后一维 `T=4` 对齐。</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="invariants" class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Invariants</p>
+          <h2>逐行对应的不变量</h2>
+        </div>
+        <div class="invariant-table" role="table" aria-label="stdout 到不变量映射">
+          <div role="row">
+            <strong role="cell">stdout 片段</strong>
+            <strong role="cell">你要读出的系统语义</strong>
+          </div>
+          <div role="row">
+            <span role="cell">input_shape=[1, 4]</span>
+            <span role="cell">单请求 batch，当前输入长度是 4。这里还没有进入 Embedding。</span>
+          </div>
+          <div role="row">
+            <span role="cell">token ids dtype=U32</span>
+            <span role="cell">这是索引，不是参与 matmul 的浮点激活。</span>
+          </div>
+          <div role="row">
+            <span role="cell">q shape=[1, 4, 4, 4]</span>
+            <span role="cell">数字上四个 4 很容易误读；真实含义是 `[B,N,S,D]`。</span>
+          </div>
+          <div role="row">
+            <span role="cell">scores shape=[1, 4, 4, 4]</span>
+            <span role="cell">最后一维是 `T`，即 K/V cache 的总长度，不一定等于当前输入 `S`。</span>
+          </div>
+          <div role="row">
+            <span role="cell">logits shape=[1, 32]</span>
+            <span role="cell">只取最后位置 hidden，再投影到 vocab size。生成只需要 `[B,V]`。</span>
+          </div>
+          <div role="row">
+            <span role="cell">cache_len=4</span>
+            <span role="cell">prefill 已经把 4 个 prompt token 的 K/V 放入请求级 cache。</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">EOS Case</p>
+          <h2>早停输出怎么读</h2>
+        </div>
+        <pre class="terminal"><code>cache comparison:
+  cached step=00 input=[1, 5, 9, 2] -> token=23 cache_len=4
+  cached step=01 input=[23] -> token=22 cache_len=5
+  recompute-all step=00 input=[1, 5, 9, 2] -> token=23 cache_len=4
+  recompute-all step=01 input=[1, 5, 9, 2, 23] -> token=22 cache_len=5
+  cached generated=2 elapsed=... token/s=...
+  recompute-all generated=2 elapsed=... token/s=...
+cache comparison result: token sequences match</code></pre>
+        <p>
+          这段输出证明三件事：cached 和 recompute-all 的 token 序列一致；EOS 命中后两边都早停；
+          性能统计使用实际生成数 `generated=2`，而不是原始 `sample_len=8`。
+        </p>
+      </section>
+
+      <section id="drills" class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Drills</p>
+          <h2>讲完这一页后必须会做的题</h2>
+        </div>
+        <div class="details-grid">
+          <details>
+            <summary>为什么 decode 的 input 是 `[23]`，但 recompute-all 是完整上下文？</summary>
+            <p>cached decode 复用历史 K/V，只喂最新 token；recompute-all 每步重算完整 token 序列。</p>
+          </details>
+          <details>
+            <summary>为什么 `Tensor::clone()` 不能等同于复制整块数据？</summary>
+            <p>Candle Tensor 是共享内部对象的句柄，clone 通常复制句柄；真正复制常发生在 `contiguous()`、dtype/device 转换或 host 读取。</p>
+          </details>
+          <details>
+            <summary>如果 EOS 检查放在 `tokens.push` 前，输出语义会怎样变化？</summary>
+            <p>你必须决定是否把 EOS token 放进最终输出。当前 tour 的语义是保留 EOS 后停止。</p>
+          </details>
+          <details>
+            <summary>为什么 `T` 比 `S` 更容易在 cache 代码里出错？</summary>
+            <p>`S` 是当前输入长度，`T` 是 cache 总长度。prefill 时常相等，decode 后通常不同。</p>
+          </details>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>建议先读这一页，再回到交互链路站做完整复盘。</span>
+      <a href="./index.html">打开链路站</a>
+    </footer>
+  </body>
+</html>

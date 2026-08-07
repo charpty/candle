@@ -51,4 +51,22 @@ mod tests {
     fn rejects_invalid_top_k() {
         assert!(build_sampling(1.0, Some(0), None).is_err());
     }
+
+    #[test]
+    fn rejects_invalid_top_p() {
+        assert!(build_sampling(1.0, None, Some(0.0)).is_err());
+        assert!(build_sampling(1.0, None, Some(1.1)).is_err());
+    }
+
+    #[test]
+    fn builds_top_k_then_top_p() {
+        assert_eq!(
+            build_sampling(0.7, Some(5), Some(0.9)).unwrap(),
+            Sampling::TopKThenTopP {
+                k: 5,
+                p: 0.9,
+                temperature: 0.7
+            }
+        );
+    }
 }

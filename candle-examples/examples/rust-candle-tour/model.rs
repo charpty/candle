@@ -40,6 +40,44 @@ impl TinyConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpectedWeight {
+    pub name: &'static str,
+    pub dims: (usize, usize),
+}
+
+pub fn expected_demo_weight_shapes(config: TinyConfig) -> Result<Vec<ExpectedWeight>> {
+    config.validate()?;
+    let h = config.hidden_size;
+    let v = config.vocab_size;
+    Ok(vec![
+        ExpectedWeight {
+            name: "model.embed_tokens.weight",
+            dims: (v, h),
+        },
+        ExpectedWeight {
+            name: "model.layers.0.self_attn.q_proj.weight",
+            dims: (h, h),
+        },
+        ExpectedWeight {
+            name: "model.layers.0.self_attn.k_proj.weight",
+            dims: (h, h),
+        },
+        ExpectedWeight {
+            name: "model.layers.0.self_attn.v_proj.weight",
+            dims: (h, h),
+        },
+        ExpectedWeight {
+            name: "model.layers.0.self_attn.o_proj.weight",
+            dims: (h, h),
+        },
+        ExpectedWeight {
+            name: "lm_head.weight",
+            dims: (v, h),
+        },
+    ])
+}
+
 /// 每个请求/会话都应持有自己的 KV Cache。
 ///
 /// `Option` 明确表达两种状态：
@@ -85,8 +123,15 @@ impl TinyAttention {
         })
     }
 
-    fn forward(&self, x: &Tensor, index_pos: usize, cache: &mut KvCache) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        cache: &mut KvCache,
+        trace_shapes: bool,
+    ) -> Result<Tensor> {
         let (batch, seq_len, hidden) = x.dims3()?;
+        trace_tensor(trace_shapes, "attn input [B,S,H]", x);
 
         // [B, S, H] -> [B, S, H]，然后拆成 head 并转置：
         // [B, S, H] -> [B, S, N, D] -> [B, N, S, D]
@@ -96,18 +141,21 @@ impl TinyAttention {
             .reshape((batch, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
+        trace_tensor(trace_shapes, "q [B,N,S,D]", &q);
         let k_new = self
             .k_proj
             .forward(x)?
             .reshape((batch, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
+        trace_tensor(trace_shapes, "k new [B,N,S,D]", &k_new);
         let v_new = self
             .v_proj
             .forward(x)?
             .reshape((batch, seq_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
+        trace_tensor(trace_shapes, "v new [B,N,S,D]", &v_new);
 
         // `match &cache.kv` 只借用旧 cache。
         // prefill 走 None；decode 用 Tensor::cat 在 sequence 维（dim=2）追加新 K/V。
@@ -122,12 +170,15 @@ impl TinyAttention {
         // Tensor::clone() 对 Candle Tensor 是共享引用计数句柄，不是复制整块 K/V 数据。
         // cache 获得共享句柄，下面的 attention 仍可继续使用局部 k/v。
         cache.kv = Some((k.clone(), v.clone()));
+        trace_tensor(trace_shapes, "k cache [B,N,T,D]", &k);
+        trace_tensor(trace_shapes, "v cache [B,N,T,D]", &v);
 
         // Q [B, N, S, D]
         // Kᵀ [B, N, D, T]
         // att [B, N, S, T]
         let scale = (self.head_dim as f64).sqrt();
         let attention_scores = (q.matmul(&k.t()?)? / scale)?;
+        trace_tensor(trace_shapes, "scores [B,N,S,T]", &attention_scores);
 
         let attention_scores = if seq_len == 1 {
             // decode 时只有当前 query，没有“当前输入内部的未来 token”。
@@ -143,12 +194,17 @@ impl TinyAttention {
         };
 
         let probabilities = candle_nn::ops::softmax_last_dim(&attention_scores)?;
+        trace_tensor(trace_shapes, "probs [B,N,S,T]", &probabilities);
 
         // [B, N, S, T] @ [B, N, T, D] -> [B, N, S, D]
         // 再转回 [B, S, N, D] -> [B, S, H]。
         let context = probabilities.matmul(&v)?;
+        trace_tensor(trace_shapes, "context heads", &context);
         let context = context.transpose(1, 2)?.reshape((batch, seq_len, hidden))?;
-        self.o_proj.forward(&context)
+        trace_tensor(trace_shapes, "context [B,S,H]", &context);
+        let output = self.o_proj.forward(&context)?;
+        trace_tensor(trace_shapes, "attn output", &output);
+        Ok(output)
     }
 }
 
@@ -186,43 +242,10 @@ impl TinyCausalLm {
     pub fn from_demo_weights(config: TinyConfig, device: &Device) -> Result<Self> {
         config.validate()?;
         let mut weights = HashMap::new();
-        let h = config.hidden_size;
-        let v = config.vocab_size;
-
-        insert_weight(&mut weights, "model.embed_tokens.weight", v, h, 1, device)?;
-        insert_weight(
-            &mut weights,
-            "model.layers.0.self_attn.q_proj.weight",
-            h,
-            h,
-            2,
-            device,
-        )?;
-        insert_weight(
-            &mut weights,
-            "model.layers.0.self_attn.k_proj.weight",
-            h,
-            h,
-            3,
-            device,
-        )?;
-        insert_weight(
-            &mut weights,
-            "model.layers.0.self_attn.v_proj.weight",
-            h,
-            h,
-            4,
-            device,
-        )?;
-        insert_weight(
-            &mut weights,
-            "model.layers.0.self_attn.o_proj.weight",
-            h,
-            h,
-            5,
-            device,
-        )?;
-        insert_weight(&mut weights, "lm_head.weight", v, h, 6, device)?;
+        for (index, weight) in expected_demo_weight_shapes(config)?.into_iter().enumerate() {
+            let (rows, cols) = weight.dims;
+            insert_weight(&mut weights, weight.name, rows, cols, index + 1, device)?;
+        }
 
         // from_tensors 取得 HashMap 的所有权；builder 内部用 trait object 统一权重来源。
         let vb = VarBuilder::from_tensors(weights, DType::F32, device);
@@ -234,20 +257,43 @@ impl TinyCausalLm {
         token_ids: &Tensor,
         index_pos: usize,
         cache: &mut KvCache,
+        trace_shapes: bool,
     ) -> Result<Tensor> {
         let (_batch, seq_len) = token_ids.dims2()?;
+        trace_tensor(trace_shapes, "token ids [B,S]", token_ids);
 
         // [B, S] -> [B, S, H]
         let hidden = self.token_embedding.forward(token_ids)?;
+        trace_tensor(trace_shapes, "embedding [B,S,H]", &hidden);
         let residual = &hidden;
-        let attended = self.attention.forward(&hidden, index_pos, cache)?;
+        let attended = self
+            .attention
+            .forward(&hidden, index_pos, cache, trace_shapes)?;
         let hidden = (attended + residual)?;
+        trace_tensor(trace_shapes, "residual [B,S,H]", &hidden);
 
         // 生成下一个 token 只需要最后一个位置：
         // [B, S, H] -> [B, H] -> [B, V]
         let last_hidden = hidden.i((.., seq_len - 1, ..))?.contiguous()?;
-        self.lm_head.forward(&last_hidden)?.to_dtype(DType::F32)
+        trace_tensor(trace_shapes, "last hidden [B,H]", &last_hidden);
+        let logits = self.lm_head.forward(&last_hidden)?.to_dtype(DType::F32)?;
+        trace_tensor(trace_shapes, "logits [B,V]", &logits);
+        Ok(logits)
     }
+}
+
+fn trace_tensor(enabled: bool, label: &str, tensor: &Tensor) {
+    if enabled {
+        println!("{}", tensor_trace_line(label, tensor));
+    }
+}
+
+fn tensor_trace_line(label: &str, tensor: &Tensor) -> String {
+    format!(
+        "    {label:<22} shape={:?} dtype={:?}",
+        tensor.dims(),
+        tensor.dtype()
+    )
 }
 
 /// 生成一个小而确定的矩阵，避免下载权重，也避免依赖后端随机数实现。
@@ -268,4 +314,78 @@ fn insert_weight(
     let tensor = Tensor::from_vec(values, (rows, cols), device)?;
     weights.insert(name.to_string(), tensor);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_head_config() {
+        let config = TinyConfig {
+            vocab_size: 8,
+            hidden_size: 10,
+            num_heads: 4,
+        };
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("must be divisible"));
+    }
+
+    #[test]
+    fn reports_expected_weight_names_and_shapes() -> Result<()> {
+        let config = TinyConfig {
+            vocab_size: 32,
+            hidden_size: 16,
+            num_heads: 4,
+        };
+        let weights = expected_demo_weight_shapes(config)?;
+        assert_eq!(
+            weights
+                .iter()
+                .map(|weight| (weight.name, weight.dims))
+                .collect::<Vec<_>>(),
+            vec![
+                ("model.embed_tokens.weight", (32, 16)),
+                ("model.layers.0.self_attn.q_proj.weight", (16, 16)),
+                ("model.layers.0.self_attn.k_proj.weight", (16, 16)),
+                ("model.layers.0.self_attn.v_proj.weight", (16, 16)),
+                ("model.layers.0.self_attn.o_proj.weight", (16, 16)),
+                ("lm_head.weight", (32, 16)),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tensor_trace_line_reports_shape_and_dtype() -> Result<()> {
+        let tensor = Tensor::new(&[1u32, 2], &Device::Cpu)?;
+        let line = tensor_trace_line("token ids [S]", &tensor);
+        assert!(line.contains("shape=[2]"));
+        assert!(line.contains(&format!("dtype={:?}", tensor.dtype())));
+        Ok(())
+    }
+
+    #[test]
+    fn forward_extends_cache_from_prefill_to_decode() -> Result<()> {
+        let device = Device::Cpu;
+        let config = TinyConfig {
+            vocab_size: 32,
+            hidden_size: 16,
+            num_heads: 4,
+        };
+        let model = TinyCausalLm::from_demo_weights(config, &device)?;
+        let mut cache = KvCache::default();
+
+        let prompt = Tensor::new(&[1u32, 5, 9], &device)?.unsqueeze(0)?;
+        let prefill_logits = model.forward(&prompt, 0, &mut cache, false)?;
+        assert_eq!(prefill_logits.dims(), &[1, config.vocab_size]);
+        assert_eq!(cache.len(), 3);
+
+        let next = Tensor::new(&[2u32], &device)?.unsqueeze(0)?;
+        let decode_logits = model.forward(&next, 3, &mut cache, false)?;
+        assert_eq!(decode_logits.dims(), &[1, config.vocab_size]);
+        assert_eq!(cache.len(), 4);
+
+        Ok(())
+    }
 }

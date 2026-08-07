@@ -4,7 +4,7 @@ extern crate intel_mkl_src;
 #[cfg(feature = "accelerate")]
 extern crate accelerate_src;
 
-use candle::{test_device, test_utils::to_vec3_round, Device, IndexOp, Result, Tensor};
+use candle::{test_device, test_utils::to_vec3_round, DType, Device, IndexOp, Result, Tensor};
 
 fn softmax(device: &Device) -> Result<()> {
     let data = &[[[3f32, 1., 4.], [1., 5., 9.]], [[2., 1., 7.], [8., 2., 8.]]];
@@ -365,6 +365,83 @@ fn sigmoid(device: &Device) -> Result<()> {
     Ok(())
 }
 
+fn pixel_shuffle_rejects_zero_upscale_factor(device: &Device) -> Result<()> {
+    let xs = Tensor::zeros((1, 4, 2, 2), DType::F32, device)?;
+    let error = candle_nn::ops::pixel_shuffle(&xs, 0)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("upscale_factor must be greater than zero"));
+    Ok(())
+}
+
+fn pixel_shuffle_rejects_non_divisible_channels(device: &Device) -> Result<()> {
+    let xs = Tensor::zeros((1, 3, 2, 2), DType::F32, device)?;
+    let error = candle_nn::ops::pixel_shuffle(&xs, 2)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("channel dimension must be divisible"));
+    Ok(())
+}
+
+fn pixel_unshuffle_rejects_zero_downscale_factor(device: &Device) -> Result<()> {
+    let xs = Tensor::zeros((1, 1, 2, 2), DType::F32, device)?;
+    let error = candle_nn::ops::pixel_unshuffle(&xs, 0)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("downscale_factor must be greater than zero"));
+    Ok(())
+}
+
+fn pixel_unshuffle_rejects_non_divisible_spatial_dims(device: &Device) -> Result<()> {
+    let xs = Tensor::zeros((1, 1, 3, 4), DType::F32, device)?;
+    let error = candle_nn::ops::pixel_unshuffle(&xs, 2)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("spatial dimensions must be divisible"));
+    Ok(())
+}
+
+fn pixel_shuffle_unshuffle_round_trip(device: &Device) -> Result<()> {
+    let xs = Tensor::arange(0f32, 16f32, device)?.reshape((1, 4, 2, 2))?;
+    let shuffled = candle_nn::ops::pixel_shuffle(&xs, 2)?;
+    assert_eq!(shuffled.dims(), &[1, 1, 4, 4]);
+
+    let unshuffled = candle_nn::ops::pixel_unshuffle(&shuffled, 2)?;
+    assert_eq!(unshuffled.dims(), xs.dims());
+    assert_eq!(
+        unshuffled.flatten_all()?.to_vec1::<f32>()?,
+        xs.flatten_all()?.to_vec1::<f32>()?
+    );
+    Ok(())
+}
+
+fn replication_pad2d(device: &Device) -> Result<()> {
+    let xs = Tensor::new(&[[1f32, 2.], [3., 4.]], device)?.reshape((1, 1, 2, 2))?;
+    let padded = candle_nn::ops::replication_pad2d(&xs, 2)?;
+    assert_eq!(padded.dims(), &[1, 1, 6, 6]);
+    assert_eq!(
+        padded.squeeze(0)?.squeeze(0)?.to_vec2::<f32>()?,
+        &[
+            [1., 1., 1., 2., 2., 2.],
+            [1., 1., 1., 2., 2., 2.],
+            [1., 1., 1., 2., 2., 2.],
+            [3., 3., 3., 4., 4., 4.],
+            [3., 3., 3., 4., 4., 4.],
+            [3., 3., 3., 4., 4., 4.],
+        ]
+    );
+    Ok(())
+}
+
+fn replication_pad2d_rejects_empty_spatial_dim(device: &Device) -> Result<()> {
+    let xs = Tensor::zeros((1, 1, 0, 2), DType::F32, device)?;
+    let error = candle_nn::ops::replication_pad2d(&xs, 1)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("empty spatial dimension"));
+    Ok(())
+}
+
 test_device!(ropei, ropei_cpu, ropei_gpu, ropei_metal);
 test_device!(rope, rope_cpu, rope_gpu, rope_metal);
 test_device!(rope_thd, rope_thd_cpu, rope_thd_gpu, rope_thd_metal);
@@ -380,3 +457,45 @@ test_device!(
 test_device!(layer_norm, ln_cpu, ln_gpu, ln_metal);
 test_device!(layer_norml, lnl_cpu, lnl_gpu, lnl_metal);
 test_device!(sigmoid, sigmoid_cpu, sigmoid_gpu, sigmoid_metal);
+test_device!(
+    pixel_shuffle_rejects_zero_upscale_factor,
+    pixel_shuffle_rejects_zero_upscale_factor_cpu,
+    pixel_shuffle_rejects_zero_upscale_factor_gpu,
+    pixel_shuffle_rejects_zero_upscale_factor_metal
+);
+test_device!(
+    pixel_shuffle_rejects_non_divisible_channels,
+    pixel_shuffle_rejects_non_divisible_channels_cpu,
+    pixel_shuffle_rejects_non_divisible_channels_gpu,
+    pixel_shuffle_rejects_non_divisible_channels_metal
+);
+test_device!(
+    pixel_unshuffle_rejects_zero_downscale_factor,
+    pixel_unshuffle_rejects_zero_downscale_factor_cpu,
+    pixel_unshuffle_rejects_zero_downscale_factor_gpu,
+    pixel_unshuffle_rejects_zero_downscale_factor_metal
+);
+test_device!(
+    pixel_unshuffle_rejects_non_divisible_spatial_dims,
+    pixel_unshuffle_rejects_non_divisible_spatial_dims_cpu,
+    pixel_unshuffle_rejects_non_divisible_spatial_dims_gpu,
+    pixel_unshuffle_rejects_non_divisible_spatial_dims_metal
+);
+test_device!(
+    pixel_shuffle_unshuffle_round_trip,
+    pixel_shuffle_unshuffle_round_trip_cpu,
+    pixel_shuffle_unshuffle_round_trip_gpu,
+    pixel_shuffle_unshuffle_round_trip_metal
+);
+test_device!(
+    replication_pad2d,
+    replication_pad2d_cpu,
+    replication_pad2d_gpu,
+    replication_pad2d_metal
+);
+test_device!(
+    replication_pad2d_rejects_empty_spatial_dim,
+    replication_pad2d_rejects_empty_spatial_dim_cpu,
+    replication_pad2d_rejects_empty_spatial_dim_gpu,
+    replication_pad2d_rejects_empty_spatial_dim_metal
+);

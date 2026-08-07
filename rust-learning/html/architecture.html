@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Candle 项目架构全景图</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Architecture Map</p>
+        <h1>Candle 项目架构全景图</h1>
+      </div>
+      <nav aria-label="页面导航">
+        <a href="./index.html">链路站</a>
+        <a href="./trace-walkthrough.html">案例</a>
+        <a href="./course-syllabus.html">大纲</a>
+        <a href="#workspace">workspace</a>
+        <a href="#pipeline">请求链路</a>
+        <a href="#debug">定位表</a>
+        <a href="#bug">bug 案例</a>
+      </nav>
+    </header>
+
+    <main class="document-page">
+      <section class="panel-section lead-panel">
+        <div class="section-heading">
+          <p class="eyebrow">Mental Model</p>
+          <h2>把 Candle 看成分层运行时，而不是示例集合</h2>
+        </div>
+        <p>
+          一次 token 生成会穿过应用入口、模型实现、神经网络积木、Tensor 运行时和执行后端。
+          这页把每层的稳定合同、源码入口、常见错误和验证命令放在一张可交付的学习图里。
+        </p>
+      </section>
+
+      <section id="workspace" class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Workspace</p>
+          <h2>crate 边界和依赖方向</h2>
+        </div>
+        <div class="layer-stack" aria-label="Candle 分层架构">
+          <article class="layer-card layer-app">
+            <span>01</span>
+            <h3>candle-examples</h3>
+            <p>CLI、tokenizer、hf-hub、模型文件选择、device 参数、输出和 tracing。</p>
+            <code>examples/llama/main.rs</code>
+          </article>
+          <article class="layer-card layer-transformer">
+            <span>02</span>
+            <h3>candle-transformers</h3>
+            <p>LLaMA、Qwen、BERT、Whisper、generation、quantized path、pipeline。</p>
+            <code>src/models/llama.rs</code>
+          </article>
+          <article class="layer-card layer-nn">
+            <span>03</span>
+            <h3>candle-nn</h3>
+            <p>Linear、Embedding、Norm、Conv、KV Cache、VarBuilder、Init、Optimizer。</p>
+            <code>src/linear.rs / var_builder.rs</code>
+          </article>
+          <article class="layer-card layer-core">
+            <span>04</span>
+            <h3>candle-core</h3>
+            <p>Tensor、Shape、Layout、DType、Device、Storage、Error、Autograd。</p>
+            <code>src/tensor.rs / storage.rs</code>
+          </article>
+          <article class="layer-card layer-backend">
+            <span>05</span>
+            <h3>CPU / CUDA / Metal</h3>
+            <p>Storage enum 把同一个 Tensor API 分发到具体后端实现。</p>
+            <code>cpu_backend / cuda_backend / metal_backend</code>
+          </article>
+        </div>
+      </section>
+
+      <section id="pipeline" class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Inference Pipeline</p>
+          <h2>一次请求从字符串到 next token</h2>
+        </div>
+        <ol class="pipeline-list">
+          <li>
+            <strong>外部输入收束成强类型状态</strong>
+            <span>`Args`、config、prompt、seed、dtype、device。这里处理字符串、文件和网络边界。</span>
+          </li>
+          <li>
+            <strong>token ids 进入 Tensor 世界</strong>
+            <span>`Vec&lt;u32&gt;` 通过 `Tensor::new(..., &device)?.unsqueeze(0)?` 变成 `[B,S]`。</span>
+          </li>
+          <li>
+            <strong>Embedding 输出浮点 hidden</strong>
+            <span>整数 token 只负责查表；进入 block 后主要是浮点 Tensor。</span>
+          </li>
+          <li>
+            <strong>Attention 把 hidden 拆成 heads</strong>
+            <span>`[B,S,H] -> [B,N,S,D]`，KV cache 让 decode 阶段的 `S` 和 `T` 分离。</span>
+          </li>
+          <li>
+            <strong>lm_head 产生 logits</strong>
+            <span>只取最后位置 hidden，投影到 vocab，得到 `[B,V]`。</span>
+          </li>
+          <li>
+            <strong>采样和停止条件推进请求态</strong>
+            <span>`LogitsProcessor` 选 token，生成循环 push token，再检查 EOS。</span>
+          </li>
+          <li>
+            <strong>Tensor op 进入后端</strong>
+            <span>`Tensor::matmul` 检查 shape/dtype/device/layout，再由 `Storage` 分发到 CPU/CUDA/Metal。</span>
+          </li>
+        </ol>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Runtime Contracts</p>
+          <h2>四个字段决定大多数错误</h2>
+        </div>
+        <div class="contract-grid">
+          <article>
+            <h3>shape</h3>
+            <p>维度值只是数字，维度语义才是合同。`[B,N,S,D]` 和 `[B,S,N,D]` 数字相同也不是同一个 Tensor。</p>
+          </article>
+          <article>
+            <h3>dtype</h3>
+            <p>token ids 是索引，hidden/logits 是浮点，量化权重有专门路径。不要靠隐式猜测转换。</p>
+          </article>
+          <article>
+            <h3>device</h3>
+            <p>输入、权重、临时 Tensor 必须在同一运行时设备。新建小 Tensor 时最容易误用 CPU。</p>
+          </article>
+          <article>
+            <h3>layout</h3>
+            <p>`transpose`、`narrow`、`reshape` 可能只是 view；`contiguous()` 才可能触发真实复制。</p>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">State Model</p>
+          <h2>模型态、请求态、临时 Tensor 态</h2>
+        </div>
+        <div class="state-lanes">
+          <article class="lane lane-model">
+            <h3>模型态</h3>
+            <p>权重、config、layer struct、VarBuilder 路径。可以跨请求共享，加载失败属于启动期错误。</p>
+            <ul>
+              <li>错误关键词：CannotFindTensor、UnexpectedShape</li>
+              <li>读源码：`vb.pp(...)`、`linear_no_bias(...)`、`Embedding`</li>
+            </ul>
+          </article>
+          <article class="lane lane-request">
+            <h3>请求态</h3>
+            <p>tokens、KV cache、sampler RNG、EOS。必须每个请求独立，不能混进模型单例。</p>
+            <ul>
+              <li>错误关键词：cache 长度、index_pos、随机性不可复现</li>
+              <li>读源码：generation loop、`Cache`、`LogitsProcessor`</li>
+            </ul>
+          </article>
+          <article class="lane lane-temp">
+            <h3>临时 Tensor 态</h3>
+            <p>forward 内部的 hidden、Q/K/V、scores、mask、logits。生命周期短，但错误最多。</p>
+            <ul>
+              <li>错误关键词：shape/dtype/device mismatch</li>
+              <li>读源码：`Tensor::matmul`、`Storage`、`Layout`</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section id="debug" class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Debug Matrix</p>
+          <h2>遇到错误时先查这张表</h2>
+        </div>
+        <div class="invariant-table" role="table" aria-label="调试定位表">
+          <div role="row">
+            <strong role="cell">症状</strong>
+            <strong role="cell">第一检查点</strong>
+          </div>
+          <div role="row">
+            <span role="cell">ShapeMismatchBinaryOp</span>
+            <span role="cell">打印 rank、batch 维和最后两维，确认 `[B,S,H]`、`[B,N,S,D]`、`[B,N,S,T]`。</span>
+          </div>
+          <div role="row">
+            <span role="cell">DTypeMismatchBinaryOp</span>
+            <span role="cell">确认 token ids、mask、hidden、logits 的 dtype，不要把索引 Tensor 当浮点激活。</span>
+          </div>
+          <div role="row">
+            <span role="cell">DeviceMismatchBinaryOp</span>
+            <span role="cell">检查每个新建 Tensor 是否都用了同一个 `device`，尤其是 mask、position ids、临时 scalar。</span>
+          </div>
+          <div role="row">
+            <span role="cell">CannotFindTensor</span>
+            <span role="cell">从 `vb.pp` 推导完整路径，对照 checkpoint key；权重路径就是模型 ABI。</span>
+          </div>
+          <div role="row">
+            <span role="cell">cached/recompute 不一致</span>
+            <span role="cell">固定 greedy，比较 `S`、`T`、`index_pos`、mask、RoPE offset 和 cache append 维度。</span>
+          </div>
+          <div role="row">
+            <span role="cell">性能突然下降</span>
+            <span role="cell">检查 layout 是否连续，是否在 decode 循环里重复 `contiguous()` 或触发 broadcasted matmul。</span>
+          </div>
+        </div>
+      </section>
+
+      <section id="bug" class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Bug Clinic</p>
+          <h2>真实修复：20 个 public API 边界</h2>
+        </div>
+        <div class="bug-grid">
+          <article class="bug-card">
+            <h3>BUG-001</h3>
+            <p>`replication_pad2d` 原实现只支持 `pad = 0/1`，并且空空间维度下有 `h - 1` 或 `w - 1` 的下溢风险。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-002</h3>
+            <p>`Llama::load` 返回 `Result<Self>`，但 block 加载用了 `unwrap()`；缺权重会 panic，而不是返回可定位错误。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-003</h3>
+            <p>`pixel_shuffle` / `pixel_unshuffle` 接收 0 factor 时会除零 panic；修复后返回明确错误，并补 round-trip 测试。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-004</h3>
+            <p>`Cache::append` 在 `max_seq_len = 0` 时扩容步长也是 0，修复前会卡在 while 扩容循环里。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-005</h3>
+            <p>`RotatingCache` 零容量下 `positions` 会取模零，append 和多 token mask 改为返回明确错误。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-006/007</h3>
+            <p>`KvCache` 和 `RotatingKvCache` 改成先更新临时副本，避免 V 失败后 K 已经污染请求态。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-008</h3>
+            <p>`ConcatKvCache::append` 先算 `next_k` / `next_v`，成功后一起提交，保证失败原子性。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-009</h3>
+            <p>`ScatteredCacheBuilder` 显式校验 `batch_mask` 长度，避免短 mask 错形状、长 mask 越界。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-010</h3>
+            <p>ViT patch embedding 在计算 patch 数前拒绝 `patch_size = 0` 和 image/patch 非整除配置。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-011/013</h3>
+            <p>`conv1d`、`conv2d`、`conv_transpose1d` 在权重 shape 计算前校验 `groups`，避免除零和非法分组。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-014/016</h3>
+            <p>ViT、LLaMA2.c 和 Granite 的 head 配置在构造 RoPE 或 attention 前拒绝 0 和不可整除关系。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-017/020</h3>
+            <p>`llama2_c`、Granite、Voxtral loader 去掉 block 加载 `unwrap()`，缺权重返回可定位错误。</p>
+          </article>
+          <article class="bug-card">
+            <h3>审计方法</h3>
+            <p>先看 public API 签名，再找 `usize` 除法/减法、index、`unwrap()`、shape 假设、配置派生和失败半更新。</p>
+          </article>
+        </div>
+        <div class="command-row">
+          <pre><code>cargo test -p candle-nn --test ops</code></pre>
+          <pre><code>cargo test -p candle-nn --test kv_cache</code></pre>
+          <pre><code>cargo test -p candle-nn --test conv</code></pre>
+          <pre><code>cargo test -p candle-transformers models::llama::tests::load_returns_error_when_block_weights_are_missing</code></pre>
+          <pre><code>cargo test -p candle-transformers models::vit::tests</code></pre>
+          <pre><code>cargo test -p candle-transformers models::llama2_c::tests</code></pre>
+          <pre><code>cargo test -p candle-transformers models::granite::tests</code></pre>
+          <pre><code>cargo test -p candle-transformers models::voxtral::voxtral_llama::tests</code></pre>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Reading Route</p>
+          <h2>按这个顺序读，不会迷路</h2>
+        </div>
+        <div class="source-grid">
+          <a href="../../Cargo.toml">workspace Cargo.toml</a>
+          <a href="../../candle-core/src/lib.rs">candle-core lib.rs</a>
+          <a href="../../candle-core/src/tensor.rs">Tensor struct</a>
+          <a href="../../candle-core/src/storage.rs">Storage dispatch</a>
+          <a href="../../candle-nn/src/lib.rs">candle-nn lib.rs</a>
+          <a href="../../candle-nn/src/var_builder.rs">VarBuilder</a>
+          <a href="../../candle-nn/src/linear.rs">Linear</a>
+          <a href="../../candle-transformers/src/models/llama.rs">LLaMA model</a>
+          <a href="../../candle-transformers/src/generation/mod.rs">generation</a>
+          <a href="../candle-project-architecture.md">Markdown 架构讲义</a>
+          <a href="../bug-hunt-report.md">bug hunt 报告</a>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>建议配合 `--trace-shapes`、`--show-weight-paths` 和 `--compare-cache` 阅读。</span>
+      <a href="./index.html">返回链路站</a>
+    </footer>
+  </body>
+</html>

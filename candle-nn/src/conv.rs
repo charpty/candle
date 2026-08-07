@@ -304,6 +304,19 @@ impl crate::Module for ConvTranspose2d {
     }
 }
 
+fn validate_groups(op: &str, in_channels: usize, out_channels: usize, groups: usize) -> Result<()> {
+    if groups == 0 {
+        candle::bail!("{op} groups must be greater than zero")
+    }
+    if in_channels % groups != 0 {
+        candle::bail!("{op} in_channels {in_channels} must be divisible by groups {groups}")
+    }
+    if out_channels % groups != 0 {
+        candle::bail!("{op} out_channels {out_channels} must be divisible by groups {groups}")
+    }
+    Ok(())
+}
+
 pub fn conv1d(
     in_channels: usize,
     out_channels: usize,
@@ -311,6 +324,7 @@ pub fn conv1d(
     cfg: Conv1dConfig,
     vb: crate::VarBuilder,
 ) -> Result<Conv1d> {
+    validate_groups("conv1d", in_channels, out_channels, cfg.groups)?;
     let init_ws = crate::init::DEFAULT_KAIMING_NORMAL;
     let ws = vb.get_with_hints(
         (out_channels, in_channels / cfg.groups, kernel_size),
@@ -333,6 +347,7 @@ pub fn conv1d_no_bias(
     cfg: Conv1dConfig,
     vb: crate::VarBuilder,
 ) -> Result<Conv1d> {
+    validate_groups("conv1d", in_channels, out_channels, cfg.groups)?;
     let init_ws = crate::init::DEFAULT_KAIMING_NORMAL;
     let ws = vb.get_with_hints(
         (out_channels, in_channels / cfg.groups, kernel_size),
@@ -349,6 +364,7 @@ pub fn conv_transpose1d(
     cfg: ConvTranspose1dConfig,
     vb: crate::VarBuilder,
 ) -> Result<ConvTranspose1d> {
+    validate_groups("conv_transpose1d", in_channels, out_channels, cfg.groups)?;
     let bound = 1. / (out_channels as f64 * kernel_size as f64).sqrt();
     let init = crate::Init::Uniform {
         lo: -bound,
@@ -370,6 +386,7 @@ pub fn conv_transpose1d_no_bias(
     cfg: ConvTranspose1dConfig,
     vb: crate::VarBuilder,
 ) -> Result<ConvTranspose1d> {
+    validate_groups("conv_transpose1d", in_channels, out_channels, cfg.groups)?;
     let bound = 1. / (out_channels as f64 * kernel_size as f64).sqrt();
     let init = crate::Init::Uniform {
         lo: -bound,
@@ -390,6 +407,7 @@ pub fn conv2d(
     cfg: Conv2dConfig,
     vb: crate::VarBuilder,
 ) -> Result<Conv2d> {
+    validate_groups("conv2d", in_channels, out_channels, cfg.groups)?;
     let init_ws = crate::init::DEFAULT_KAIMING_NORMAL;
     let ws = vb.get_with_hints(
         (
@@ -417,6 +435,7 @@ pub fn conv2d_no_bias(
     cfg: Conv2dConfig,
     vb: crate::VarBuilder,
 ) -> Result<Conv2d> {
+    validate_groups("conv2d", in_channels, out_channels, cfg.groups)?;
     let init_ws = crate::init::DEFAULT_KAIMING_NORMAL;
     let ws = vb.get_with_hints(
         (

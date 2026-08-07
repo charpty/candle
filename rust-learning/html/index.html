@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rust + Candle 推理链路讲解站</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#stage-title">跳到当前阶段</a>
+
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Rust + Candle Learning Package</p>
+        <h1>推理链路讲解站</h1>
+      </div>
+      <nav aria-label="页面区域">
+        <a href="#chain">链路</a>
+        <a href="#state">状态</a>
+        <a href="#lab">实验</a>
+        <a href="./architecture.html">架构</a>
+        <a href="./course-syllabus.html">大纲</a>
+        <a href="./trace-walkthrough.html">案例</a>
+        <a href="#source">源码</a>
+        <a href="#score">验收</a>
+      </nav>
+    </header>
+
+    <main>
+      <section id="chain" class="workspace" aria-labelledby="chain-title">
+        <aside class="rail" aria-label="推理阶段">
+          <div class="section-heading">
+            <p class="eyebrow">Inference Path</p>
+            <h2 id="chain-title">从 CLI 到 next token</h2>
+          </div>
+          <div class="stage-list" id="stage-list"></div>
+        </aside>
+
+        <section class="stage-map" aria-label="整体链路图">
+          <div class="flow-grid" id="flow-grid"></div>
+          <div class="legend">
+            <span><i class="dot request"></i>请求态</span>
+            <span><i class="dot tensor"></i>Tensor 临时态</span>
+            <span><i class="dot model"></i>模型态</span>
+            <span><i class="dot backend"></i>后端态</span>
+          </div>
+        </section>
+
+        <section class="inspector" aria-live="polite">
+          <div class="section-heading">
+            <p class="eyebrow" id="stage-kind">Stage</p>
+            <h2 id="stage-title">选择一个阶段</h2>
+          </div>
+          <p id="stage-summary" class="summary"></p>
+
+          <div class="metric-grid" id="stage-metrics"></div>
+
+          <div class="info-block">
+            <h3>Rust 语义</h3>
+            <p id="stage-rust"></p>
+          </div>
+
+          <div class="info-block">
+            <h3>Candle 合同</h3>
+            <p id="stage-candle"></p>
+          </div>
+
+          <div class="info-block">
+            <h3>常见误解</h3>
+            <p id="stage-pitfall"></p>
+          </div>
+
+          <div class="command-card">
+            <div>
+              <h3>验证命令</h3>
+              <p id="stage-command-note"></p>
+            </div>
+            <button class="copy-button" type="button" data-copy-target="stage-command">复制</button>
+            <pre><code id="stage-command"></code></pre>
+          </div>
+        </section>
+      </section>
+
+      <section id="state" class="panel-section" aria-labelledby="state-title">
+        <div class="section-heading">
+          <p class="eyebrow">State Ownership</p>
+          <h2 id="state-title">三类状态不要混在一起</h2>
+        </div>
+        <div class="state-lanes">
+          <article class="lane lane-model">
+            <h3>模型态</h3>
+            <p>权重、配置、只读模块。可以跨请求共享，但加载失败属于启动期错误。</p>
+            <ul>
+              <li>Embedding / Linear / Attention 权重</li>
+              <li>VarBuilder 路径和 dtype/device</li>
+              <li>TinyConfig 与真实 LLaMA config</li>
+            </ul>
+          </article>
+          <article class="lane lane-request">
+            <h3>请求态</h3>
+            <p>tokens、KV Cache、sampler、EOS。每个请求独立，否则会发生上下文串扰。</p>
+            <ul>
+              <li>prompt token ids 与已生成 token</li>
+              <li>K/V cache 长度和 index_pos</li>
+              <li>RNG seed、temperature、top-k/top-p</li>
+            </ul>
+          </article>
+          <article class="lane lane-temp">
+            <h3>临时 Tensor 态</h3>
+            <p>forward 内部的 shape、dtype、layout、device。错误大多通过 Result 返回。</p>
+            <ul>
+              <li>input [B,S]、hidden [B,S,H]</li>
+              <li>Q/K/V [B,N,S,D] 与 scores [B,N,S,T]</li>
+              <li>stride、start offset、contiguous</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section id="lab" class="lab-grid" aria-labelledby="lab-title">
+        <div class="section-heading">
+          <p class="eyebrow">Shape Lab</p>
+          <h2 id="lab-title">prefill / decode 形状实验台</h2>
+        </div>
+
+        <form class="controls" aria-label="形状实验参数">
+          <label>
+            模式
+            <select id="mode-select">
+              <option value="cached">cached decode</option>
+              <option value="recompute">recompute-all</option>
+            </select>
+          </label>
+          <label>
+            生成 step
+            <input id="step-range" type="range" min="0" max="3" value="0" />
+          </label>
+          <output id="step-output">step 0</output>
+        </form>
+
+        <div class="lab-cards">
+          <article class="lab-card">
+            <h3>输入窗口</h3>
+            <dl id="context-table"></dl>
+          </article>
+          <article class="lab-card">
+            <h3>Attention 合同</h3>
+            <dl id="shape-table"></dl>
+          </article>
+          <article class="lab-card">
+            <h3>停止条件</h3>
+            <p id="eos-note"></p>
+            <p class="small">默认 greedy 序列前两步是 23、22。设置 <code>--eos-token 22</code> 会在第二步后停止。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="source" class="panel-section source-panel" aria-labelledby="source-title">
+        <div class="section-heading">
+          <p class="eyebrow">Source Map</p>
+          <h2 id="source-title">读源码时按这一张表走</h2>
+        </div>
+        <div class="source-grid">
+          <a href="../../candle-examples/examples/rust-candle-tour/main.rs">tour main.rs</a>
+          <a href="../../candle-examples/examples/rust-candle-tour/model.rs">tour model.rs</a>
+          <a href="../../candle-examples/examples/rust-candle-tour/sampling.rs">tour sampling.rs</a>
+          <a href="../../candle-examples/examples/rust-candle-tour/layout_walkthrough.rs">layout walkthrough</a>
+          <a href="../../candle-examples/examples/rust-candle-tour/backend_walkthrough.rs">backend walkthrough</a>
+          <a href="../../candle-transformers/src/models/llama.rs">真实 LLaMA 模型</a>
+          <a href="../../candle-core/src/tensor.rs">Tensor</a>
+          <a href="../../candle-core/src/layout.rs">Layout</a>
+          <a href="../../candle-nn/src/var_builder.rs">VarBuilder</a>
+          <a href="./architecture.html">项目架构全景图</a>
+          <a href="../candle-project-architecture.md">项目级架构讲义</a>
+          <a href="../bug-hunt-report.md">bug hunt 报告</a>
+          <a href="./course-syllabus.html">课程大纲与交付标准</a>
+          <a href="./trace-walkthrough.html">一次生成全链路拆解</a>
+        </div>
+      </section>
+
+      <section id="score" class="panel-section score-panel" aria-labelledby="score-title">
+        <div class="section-heading">
+          <p class="eyebrow">Quality Gate</p>
+          <h2 id="score-title">售卖级学习包验收</h2>
+        </div>
+        <div class="score-layout">
+          <div class="score-meter">
+            <div class="ring" id="score-ring" aria-label="完成度">0%</div>
+            <p>这些不是装饰性 checklist。每一项都对应一个能运行的命令、一个源码位置或一个测试。</p>
+          </div>
+          <div class="checklist" id="checklist"></div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>本 HTML 不依赖网络，可直接用浏览器打开。</span>
+      <a href="../README.md">返回 Markdown 总索引</a>
+    </footer>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

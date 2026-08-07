@@ -89,6 +89,16 @@ pub struct Cache {
 
 impl Cache {
     pub fn new(use_kv_cache: bool, cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        if cfg.n_heads == 0 {
+            candle::bail!("n_heads must be greater than zero")
+        }
+        if cfg.dim % cfg.n_heads != 0 {
+            candle::bail!(
+                "dim {} must be divisible by n_heads {}",
+                cfg.dim,
+                cfg.n_heads
+            )
+        }
         let n_elem = cfg.dim / cfg.n_heads;
         let theta: Vec<_> = (0..n_elem)
             .step_by(2)
@@ -360,8 +370,8 @@ impl Llama {
         let lm_head = linear(cfg.dim, cfg.vocab_size, vb.pp("lm_head"))?;
         let ln_f = rms_norm(cfg.dim, cfg.norm_eps, vb.pp("model.norm"))?;
         let blocks: Vec<_> = (0..cfg.n_layers)
-            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), &cfg).unwrap())
-            .collect();
+            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), &cfg))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             wte,
             blocks,
@@ -369,5 +379,62 @@ impl Llama {
             lm_head,
             config: cfg,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_config() -> Config {
+        Config {
+            dim: 4,
+            hidden_dim: 8,
+            n_layers: 1,
+            n_heads: 2,
+            n_kv_heads: 2,
+            vocab_size: 8,
+            seq_len: 4,
+            norm_eps: 1e-5,
+        }
+    }
+
+    #[test]
+    fn cache_rejects_zero_heads() -> Result<()> {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.n_heads = 0;
+
+        let err = Cache::new(false, &cfg, VarBuilder::zeros(DType::F32, &device))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("n_heads"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn load_returns_error_when_block_weights_are_missing() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = tiny_config();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "model.embed_tokens.weight".to_string(),
+            Tensor::zeros((cfg.vocab_size, cfg.dim), DType::F32, &device)?,
+        );
+        tensors.insert(
+            "lm_head.weight".to_string(),
+            Tensor::zeros((cfg.vocab_size, cfg.dim), DType::F32, &device)?,
+        );
+        tensors.insert(
+            "model.norm.weight".to_string(),
+            Tensor::ones(cfg.dim, DType::F32, &device)?,
+        );
+
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &device);
+        let err = Llama::load(vb, cfg).unwrap_err().to_string();
+        assert!(err.contains("model.layers.0"));
+
+        Ok(())
     }
 }

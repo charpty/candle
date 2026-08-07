@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rust + Candle 课程大纲与交付标准</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Course Syllabus</p>
+        <h1>课程大纲与交付标准</h1>
+      </div>
+      <nav aria-label="页面导航">
+        <a href="./index.html">链路站</a>
+        <a href="./architecture.html">架构</a>
+        <a href="./trace-walkthrough.html">案例课</a>
+        <a href="#modules">模块</a>
+        <a href="#evidence">验收</a>
+      </nav>
+    </header>
+
+    <main class="document-page">
+      <section class="panel-section lead-panel">
+        <div class="section-heading">
+          <p class="eyebrow">Audience</p>
+          <h2>面向有 C++/系统背景、想进入 Rust 推理工程的人</h2>
+        </div>
+        <p>
+          这套资料不按语法书顺序讲 Rust，而是沿一次 Candle LLM 推理请求学习语言、Tensor
+          系统和工程边界。学员最终要能读懂真实 LLaMA forward，并能小范围修改 tour 代码且补测试。
+        </p>
+      </section>
+
+      <section id="modules" class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Modules</p>
+          <h2>7 个模块覆盖从入口到后端</h2>
+        </div>
+        <div class="module-grid">
+          <article>
+            <h3>0. 工程地图</h3>
+            <p>workspace、crate、example、core、nn、transformers 的边界。</p>
+            <ul>
+              <li>能说明 Candle 分层</li>
+              <li>能找到 LLaMA 入口和模型实现</li>
+              <li>能跑 rust-candle-tour</li>
+            </ul>
+          </article>
+          <article>
+            <h3>0.5 项目架构全景</h3>
+            <p>从 workspace 到 Tensor 内部结构，再到 Storage 后端分发和错误定位。</p>
+            <ul>
+              <li>能解释依赖方向</li>
+              <li>能区分模型态、请求态、临时 Tensor 态</li>
+              <li>能用定位表分析 shape/device/weight 错误</li>
+            </ul>
+          </article>
+          <article>
+            <h3>1. Rust 基础嵌入推理主线</h3>
+            <p>用 `Args`、`parse_prompt`、`Result`、`Option`、borrow 学 Rust。</p>
+            <ul>
+              <li>能解释 `?` 和 `bail!`</li>
+              <li>能修复 Vec slice 与 push 的借用冲突</li>
+              <li>能写输入校验测试</li>
+            </ul>
+          </article>
+          <article>
+            <h3>2. Tensor 合同</h3>
+            <p>shape、dtype、device、layout、stride、contiguous。</p>
+            <ul>
+              <li>能手算 `[B,S,H] -> [B,N,S,D]`</li>
+              <li>能解释 view 和 copy</li>
+              <li>能读 `--trace-shapes` 输出</li>
+            </ul>
+          </article>
+          <article>
+            <h3>3. 权重加载</h3>
+            <p>VarBuilder 路径、SafeTensors、mmap、config 校验。</p>
+            <ul>
+              <li>能从 `vb.pp` 推导权重名</li>
+              <li>能区分模型态和请求态</li>
+              <li>能定位 shape/name mismatch</li>
+            </ul>
+          </article>
+          <article>
+            <h3>4. Attention 与 KV Cache</h3>
+            <p>prefill、decode、causal mask、cache append、recompute 对比。</p>
+            <ul>
+              <li>能解释 `S` 和 `T` 的区别</li>
+              <li>能说明 cache 为什么请求独立</li>
+              <li>能验证 cached/recompute 一致</li>
+            </ul>
+          </article>
+          <article>
+            <h3>5. Sampling 与停止条件</h3>
+            <p>greedy、temperature、top-k/top-p、RNG、EOS。</p>
+            <ul>
+              <li>能用 enum/match 表达状态空间</li>
+              <li>能说明 EOS 检查位置</li>
+              <li>能扩展多 EOS 并补测试</li>
+            </ul>
+          </article>
+          <article>
+            <h3>6. 工程化与 unsafe 边界</h3>
+            <p>feature、cfg、tracing、并发状态、mmap/FFI safety invariant。</p>
+            <ul>
+              <li>能区分编译期 feature 和运行时参数</li>
+              <li>能设计请求独立 cache 的服务状态</li>
+              <li>能写 unsafe 审计条目</li>
+            </ul>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Learning Tracks</p>
+          <h2>三种学习节奏</h2>
+        </div>
+        <div class="details-grid">
+          <details open>
+            <summary>3 天速通</summary>
+            <p>只跑 tour 命令、读 HTML 链路站、完成考题 A/B/D。适合已有 Rust 基础的人快速建立 Candle 主线。</p>
+          </details>
+          <details>
+            <summary>7 天标准</summary>
+            <p>每天一个模块，配合 labs 做小破坏和修复。最后完成 100 分考题和两道实操题。</p>
+          </details>
+          <details>
+            <summary>14 天深读</summary>
+            <p>前 7 天走 tour，后 7 天追真实 LLaMA、VarBuilder、Tensor/Layout、backend dispatch。</p>
+          </details>
+          <details>
+            <summary>企业内训</summary>
+            <p>用 HTML 链路站讲整体，trace 案例页做课堂拆解，考试和评分参考做课后验收。</p>
+          </details>
+        </div>
+      </section>
+
+      <section id="evidence" class="panel-section">
+        <div class="section-heading">
+          <p class="eyebrow">Evidence</p>
+          <h2>交付物和验收证据</h2>
+        </div>
+        <div class="invariant-table" role="table" aria-label="交付物验收表">
+          <div role="row">
+            <strong role="cell">交付物</strong>
+            <strong role="cell">验收证据</strong>
+          </div>
+          <div role="row">
+            <span role="cell">HTML 链路站</span>
+            <span role="cell">可离线打开，能交互切换阶段、shape 实验台和 checklist。</span>
+          </div>
+          <div role="row">
+            <span role="cell">项目架构全景图</span>
+            <span role="cell">能说明 workspace、crate 边界、Tensor 合同、后端分发和 bug hunt 方法。</span>
+          </div>
+          <div role="row">
+            <span role="cell">trace 案例课</span>
+            <span role="cell">能把 stdout 逐行映射到 shape/dtype/cache/EOS 不变量。</span>
+          </div>
+          <div role="row">
+            <span role="cell">tour 示例代码</span>
+            <span role="cell">`cargo test -p candle-examples --example rust-candle-tour` 通过。</span>
+          </div>
+          <div role="row">
+            <span role="cell">实验手册</span>
+            <span role="cell">每个实验有运行、观察、小破坏、修复、达标问题。</span>
+          </div>
+          <div role="row">
+            <span role="cell">考试和评分参考</span>
+            <span role="cell">题目、分值、答案要点、扣分点和补课路径分离。</span>
+          </div>
+          <div role="row">
+            <span role="cell">真实 bug 报告</span>
+            <span role="cell">至少包含一个可复现 bug、修复说明和测试命令。</span>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <span>这页用于交付前说明课程边界和验收标准。</span>
+      <a href="../README.md">返回总索引</a>
+    </footer>
+  </body>
+</html>

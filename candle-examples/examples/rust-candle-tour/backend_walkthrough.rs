@@ -28,18 +28,34 @@
 use candle::{Device, Result, Tensor};
 
 pub fn run(device: &Device) -> Result<()> {
+    let (a_dims, b_dims, product) = demo_matmul(device)?;
+    println!("backend tour: {a_dims:?} x {b_dims:?} = {product:?}");
+    Ok(())
+}
+
+fn demo_matmul(device: &Device) -> Result<(Vec<usize>, Vec<usize>, Vec<Vec<f32>>)> {
     let a = Tensor::new(&[[1f32, 2.0], [3.0, 4.0]], device)?;
     let b = Tensor::new(&[[5f32, 6.0], [7.0, 8.0]], device)?;
+    let a_dims = a.dims().to_vec();
+    let b_dims = b.dims().to_vec();
 
     // &b 是共享借用。matmul 不消费 a/b，调用后两者仍然可用。
     let c = a.matmul(&b)?;
 
     // to_vec2 会把结果变成 host Vec<Vec<f32>>；GPU 上这意味着 device-to-host 读取。
-    println!(
-        "backend tour: {:?} x {:?} = {:?}",
-        a.dims(),
-        b.dims(),
-        c.to_vec2::<f32>()?
-    );
-    Ok(())
+    Ok((a_dims, b_dims, c.to_vec2::<f32>()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn demo_matmul_matches_manual_product() -> Result<()> {
+        let (a_dims, b_dims, product) = demo_matmul(&Device::Cpu)?;
+        assert_eq!(a_dims, vec![2, 2]);
+        assert_eq!(b_dims, vec![2, 2]);
+        assert_eq!(product, vec![vec![19.0, 22.0], vec![43.0, 50.0]]);
+        Ok(())
+    }
 }

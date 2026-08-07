@@ -18,9 +18,37 @@
 - [Linear 实现](../candle-nn/src/linear.rs)
 - [Embedding 实现](../candle-nn/src/embedding.rs)
 
+## 学习包索引
+
+- [Rust + Candle 推理链路讲解站](./html/index.html)：可直接打开的 HTML 学习站，把 CLI、
+  Tensor、VarBuilder、Attention、KV Cache、Sampling、EOS 和后端分发串成一张交互链路图；
+  另有 [项目架构全景图](./html/architecture.html)、[课程大纲与交付标准](./html/course-syllabus.html) 和
+  [一次生成全链路拆解](./html/trace-walkthrough.html) 可作为对外交付页。
+- [Candle 项目级架构讲义](./candle-project-architecture.md)：从 workspace、crate 边界、Tensor
+  内部结构、后端分发、模型加载到一次 token 生成，讲清整个项目的主干。
+- [Candle bug hunt 报告](./bug-hunt-report.md)：记录 20 个真实边界问题的发现、复现、修复、
+  UT 和审计方法，覆盖通用 ops、conv groups、模型加载、KV cache 状态原子性、散列缓存 batch mask、
+  ViT 配置校验和 LLaMA/Granite/Voxtral cache 配置。
+- [本文件](./README.md)：按课程讲 Rust 和 Candle 推理主线，解释完整知识框架。
+- [Rust + Candle 典型用法精讲](./typical-patterns.md)：把本文和 tour 代码里反复出现的
+  `Result`、`Option`、借用、Tensor layout、`Module`、`VarBuilder`、KV Cache、Cargo feature、
+  Serde、unsafe、tracing 等用法拆开讲。
+- [Rust + Candle 深度专题：从类型系统到推理系统不变量](./deep-inference-systems.md)：更深入地
+  串起所有权、shape、layout、Device、KV Cache、后端分发、unsafe 和服务化边界。
+- [Rust + Candle 动手实验手册](./rust-candle-labs.md)：按命令输出、可恢复的小破坏、编译器错误、
+  测试和源码阅读记录，把概念真正练到手上。
+- [Candle 源码阅读路线图](./source-reading-playbook.md)：按一次推理请求的生命周期说明每条
+  调用链该看哪些文件、追到哪里停、要验证什么。
+- [Rust + Candle 学习自检表](./checkpoints.md)：按课程列出必须能解释的点、要跑的命令、
+  小改动练习、常见误解和达标标准。
+- [Rust + Candle 水平测评题](./rust-candle-exam.md)：100 分闭卷/半开卷考题，用来检验
+  Rust 所有权、Tensor layout、模型加载、KV Cache、工程化和 unsafe 边界掌握情况。
+- [Rust + Candle 水平测评题评分参考](./rust-candle-exam-grading-guide.md)：考后对照用的
+  答案要点、扣分点和补课路线。
+
 ## 配套可执行源码导览
 
-如果你更喜欢直接沿代码学习，从下面四个文件按顺序看：
+如果你更喜欢直接沿代码学习，从下面五个文件按顺序看：
 
 1. [main.rs](../candle-examples/examples/rust-candle-tour/main.rs)：架构图、主流程、
    prefill/decode 生成循环，以及沿途出现的 Rust 所有权和借用。
@@ -30,6 +58,11 @@
    `match`、参数校验与单元测试。
 4. [backend_walkthrough.rs](../candle-examples/examples/rust-candle-tour/backend_walkthrough.rs)：
    `Tensor::matmul` 如何经过 Storage 分发到 CPU/CUDA/Metal。
+5. [layout_walkthrough.rs](../candle-examples/examples/rust-candle-tour/layout_walkthrough.rs)：
+   `transpose`、`narrow` 和 `contiguous()` 如何改变 Tensor layout。
+
+动手练习按 [Rust + Candle 动手实验手册](./rust-candle-labs.md) 走：每个实验都有运行命令、
+观察点、小破坏、修复方式和达标问题。
 
 示例使用本地生成的小权重，不需要下载模型：
 
@@ -40,6 +73,61 @@ cargo run -p candle-examples \
   -- \
   --cpu \
   --show-backend-path
+```
+
+如果想把 prefill/decode 中每个关键 Tensor 的 shape 和 dtype 打出来：
+
+```bash
+cargo run -p candle-examples \
+  --example rust-candle-tour \
+  -- \
+  --cpu \
+  --trace-shapes \
+  -n 2
+```
+
+如果想观察 Tensor layout、stride 和 `contiguous()`：
+
+```bash
+cargo run -p candle-examples \
+  --example rust-candle-tour \
+  -- \
+  --cpu \
+  --show-layout-path \
+  -n 0
+```
+
+如果想看 demo 模型通过 `VarBuilder` 期望加载哪些权重路径：
+
+```bash
+cargo run -p candle-examples \
+  --example rust-candle-tour \
+  -- \
+  --cpu \
+  --show-weight-paths \
+  -n 0
+```
+
+如果想比较 KV cache 解码和每步全量重算：
+
+```bash
+cargo run -p candle-examples \
+  --example rust-candle-tour \
+  -- \
+  --cpu \
+  --compare-cache \
+  -n 4
+```
+
+如果想观察 EOS 停止逻辑：
+
+```bash
+cargo run -p candle-examples \
+  --example rust-candle-tour \
+  -- \
+  --cpu \
+  --eos-token 22 \
+  -n 8
 ```
 
 这份长文档解释“为什么”，配套代码展示“实际怎么写”。后续学习优先沿代码走，遇到概念时再
@@ -1264,11 +1352,23 @@ let b = a.to_dtype(DType::F16)?;
 
 ### 练习 C：观察 stride
 
-写一个小示例，打印 Tensor 在 transpose 前后的：
+运行配套示例：
 
-```rust
-println!("shape={:?}, stride={:?}", x.dims(), x.stride());
+```bash
+cargo run -p candle-examples \
+  --example rust-candle-tour \
+  -- \
+  --cpu \
+  --show-layout-path \
+  -n 0
 ```
+
+观察：
+
+- `base` 的 stride 是标准 row-major stride。
+- `transpose(1,2)` 改变 dims 和 stride，通常不复制 Storage。
+- `narrow(dim=1)` 改变 start offset，view 可能不再是 contiguous。
+- `contiguous()` 把非连续 view 打包成新的 row-major layout。
 
 验证数据不复制也能得到不同的二维观察方式。
 
@@ -2183,26 +2283,46 @@ B=1, S=16, H=4096, Nq=32, Nkv=8
 
 ### 练习 B：观测 prefill/decode
 
-在循环中临时打印：
+运行配套示例：
 
-```rust
-println!(
-    "index={index}, context_size={context_size}, context_index={context_index}"
-);
+```bash
+cargo run -p candle-examples \
+  --example rust-candle-tour \
+  -- \
+  --cpu \
+  --trace-shapes \
+  --prompt 1,5,9,2 \
+  -n 2
 ```
 
-用短 prompt 和短 `sample_len` 观察第一次与后续循环的区别。
+观察第一次 prefill 与后续 decode 的区别：
+
+- `context_size` 第一次等于 prompt 长度，后续等于 1。
+- Q 的 `S` 第一次等于 prompt 长度，后续等于 1。
+- K/V cache 的 `T` 会随着生成逐步增长。
+- logits 始终是 `[B, vocab]`，因为每轮只采样下一个 token。
 
 ### 练习 C：比较 KV Cache
 
-分别运行开启和关闭 KV Cache 的版本，记录：
+运行配套示例：
 
-- prompt token 数。
-- 生成 token 数。
-- token/s。
-- 预期计算量差异。
+```bash
+cargo run -p candle-examples \
+  --example rust-candle-tour \
+  -- \
+  --cpu \
+  --compare-cache \
+  --prompt 1,5,9,2 \
+  -n 4
+```
 
-不要只记录“哪个快”，要解释为什么。
+观察 cached 与 recompute-all：
+
+- cached 第一次处理完整 prompt，后续只处理最新 token。
+- recompute-all 每一步都从第一个 token 重新算到当前最后一个 token。
+- 两者 greedy 结果应一致；差异在计算量，不在模型语义。
+- tiny demo 的 token/s 只适合观察方法，不代表真实 LLM 的性能结论。
+- `--compare-cache` 目前要求 `--temperature 0.0`，避免随机采样让对比变成 RNG 测试。
 
 ---
 
