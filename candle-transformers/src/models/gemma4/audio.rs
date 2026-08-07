@@ -8,6 +8,89 @@ use candle_nn::{Conv1d, Conv2d, Conv2dConfig, VarBuilder};
 
 use super::config::Gemma4AudioConfig;
 
+const SSCP_NUM_CONV_LAYERS: usize = 2;
+
+fn validate_audio_attention_config(cfg: &Gemma4AudioConfig) -> Result<()> {
+    if cfg.hidden_size == 0 {
+        candle::bail!("hidden_size must be greater than zero")
+    }
+    if cfg.hidden_size % 2 != 0 {
+        candle::bail!("hidden_size must be even for relative position embeddings")
+    }
+    if cfg.conf_num_attention_heads == 0 {
+        candle::bail!("conf_num_attention_heads must be greater than zero")
+    }
+    if cfg.hidden_size % cfg.conf_num_attention_heads != 0 {
+        candle::bail!(
+            "hidden_size must be divisible by conf_num_attention_heads, got hidden_size={} and conf_num_attention_heads={}",
+            cfg.hidden_size,
+            cfg.conf_num_attention_heads
+        )
+    }
+    if cfg.conf_attention_chunk_size == 0 {
+        candle::bail!("conf_attention_chunk_size must be greater than zero")
+    }
+    Ok(())
+}
+
+fn validate_sscp_conv_config(cfg: &Gemma4AudioConfig) -> Result<()> {
+    if cfg.sscp_conv_channel_size.len() < SSCP_NUM_CONV_LAYERS {
+        candle::bail!("sscp_conv_channel_size must contain at least {SSCP_NUM_CONV_LAYERS} entries")
+    }
+    if cfg
+        .sscp_conv_channel_size
+        .iter()
+        .take(SSCP_NUM_CONV_LAYERS)
+        .any(|&channels| channels == 0)
+    {
+        candle::bail!("sscp_conv_channel_size entries must be greater than zero")
+    }
+    if cfg.sscp_conv_kernel_size.len() < SSCP_NUM_CONV_LAYERS {
+        candle::bail!("sscp_conv_kernel_size must contain at least {SSCP_NUM_CONV_LAYERS} entries")
+    }
+    if cfg.sscp_conv_stride_size.len() < SSCP_NUM_CONV_LAYERS {
+        candle::bail!("sscp_conv_stride_size must contain at least {SSCP_NUM_CONV_LAYERS} entries")
+    }
+
+    let mut current_f = cfg.input_feat_size;
+    for idx in 0..SSCP_NUM_CONV_LAYERS {
+        let kernel = &cfg.sscp_conv_kernel_size[idx];
+        let stride = &cfg.sscp_conv_stride_size[idx];
+        if kernel.len() < 2 {
+            candle::bail!("sscp_conv_kernel_size[{idx}] must contain time and frequency entries")
+        }
+        if stride.len() < 2 {
+            candle::bail!("sscp_conv_stride_size[{idx}] must contain time and frequency entries")
+        }
+        if kernel[0] == 0 || kernel[1] == 0 {
+            candle::bail!("sscp_conv_kernel_size entries must be greater than zero")
+        }
+        if stride[0] == 0 || stride[1] == 0 {
+            candle::bail!("sscp_conv_stride_size entries must be greater than zero")
+        }
+        let Some(f_in_padded) = current_f.checked_add(2) else {
+            candle::bail!("frequency dimension overflow")
+        };
+        if kernel[1] > f_in_padded {
+            candle::bail!(
+                "sscp_conv_kernel_size[{idx}][1] must fit padded frequency dimension, got kernel={} and padded frequency={f_in_padded}",
+                kernel[1]
+            )
+        }
+        current_f = (f_in_padded - kernel[1]) / stride[1] + 1;
+    }
+    Ok(())
+}
+
+fn validate_audio_config(cfg: &Gemma4AudioConfig) -> Result<()> {
+    validate_audio_attention_config(cfg)?;
+    validate_sscp_conv_config(cfg)?;
+    if cfg.conf_conv_kernel_size == 0 {
+        candle::bail!("conf_conv_kernel_size must be greater than zero")
+    }
+    Ok(())
+}
+
 // ── RmsNorm (standard, no +1 offset for audio) ─────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -178,6 +261,7 @@ struct SubSampleConvProjection {
 
 impl SubSampleConvProjection {
     fn new(cfg: &Gemma4AudioConfig, vb: VarBuilder) -> Result<Self> {
+        validate_sscp_conv_config(cfg)?;
         let mut current_f = cfg.input_feat_size;
         let mut f_out_dims = Vec::new();
 
@@ -235,6 +319,7 @@ struct RelativePositionEmbedding {
 
 impl RelativePositionEmbedding {
     fn new(cfg: &Gemma4AudioConfig, vb: VarBuilder) -> Result<Self> {
+        validate_audio_attention_config(cfg)?;
         let num_heads = cfg.conf_num_attention_heads;
         let channels = cfg.hidden_size;
         let head_dim = channels / num_heads;
@@ -393,6 +478,7 @@ struct ConformerAttention {
 
 impl ConformerAttention {
     fn new(cfg: &Gemma4AudioConfig, vb: VarBuilder) -> Result<Self> {
+        validate_audio_attention_config(cfg)?;
         let num_heads = cfg.conf_num_attention_heads;
         let hidden_size = cfg.hidden_size;
         let head_dim = hidden_size / num_heads;
@@ -711,6 +797,9 @@ struct ConformerLightConv1d {
 
 impl ConformerLightConv1d {
     fn new(cfg: &Gemma4AudioConfig, vb: VarBuilder) -> Result<Self> {
+        if cfg.conf_conv_kernel_size == 0 {
+            candle::bail!("conf_conv_kernel_size must be greater than zero")
+        }
         Ok(Self {
             pre_layer_norm: RmsNorm::new(
                 cfg.hidden_size,
@@ -817,6 +906,7 @@ pub struct AudioModel {
 
 impl AudioModel {
     pub fn new(cfg: &Gemma4AudioConfig, vb: VarBuilder) -> Result<Self> {
+        validate_audio_config(cfg)?;
         let subsample_conv_projection =
             SubSampleConvProjection::new(cfg, vb.pp("subsample_conv_projection"))?;
         let mut conformer = Vec::with_capacity(cfg.conf_num_hidden_layers);
@@ -887,5 +977,146 @@ impl AudioModel {
             .where_cond(&audio_encodings, &zeros)?;
 
         Ok((audio_encodings, current_mask))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_config() -> Gemma4AudioConfig {
+        Gemma4AudioConfig {
+            input_feat_size: 8,
+            hidden_size: 4,
+            output_proj_dims: None,
+            conf_attention_chunk_size: 2,
+            conf_attention_context_left: 1,
+            conf_attention_context_right: 0,
+            conf_attention_invalid_logits_value: -1e9,
+            conf_attention_logit_cap: 50.0,
+            conf_num_attention_heads: 2,
+            conf_num_hidden_layers: 1,
+            conf_conv_kernel_size: 3,
+            conf_reduction_factor: 1,
+            conf_residual_weight: 0.5,
+            sscp_conv_channel_size: vec![2, 2],
+            sscp_conv_kernel_size: vec![vec![3, 3], vec![3, 3]],
+            sscp_conv_stride_size: vec![vec![2, 2], vec![2, 2]],
+            vocab_size: 8,
+            sscp_conv_group_norm_eps: 1e-6,
+            sscp_conv_eps: 1e-3,
+            rms_norm_eps: 1e-6,
+            gradient_clipping: 1e10,
+        }
+    }
+
+    fn assert_err_contains<T: std::fmt::Debug>(result: Result<T>, expected: &str) {
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(expected),
+            "expected error containing {expected:?}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn audio_model_rejects_zero_attention_heads() {
+        let device = candle::Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.conf_num_attention_heads = 0;
+        assert_err_contains(
+            AudioModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("audio")),
+            "conf_num_attention_heads must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn audio_model_rejects_non_divisible_attention_heads() {
+        let device = candle::Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.hidden_size = 6;
+        cfg.conf_num_attention_heads = 4;
+        assert_err_contains(
+            AudioModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("audio")),
+            "hidden_size must be divisible by conf_num_attention_heads",
+        );
+    }
+
+    #[test]
+    fn audio_model_rejects_odd_hidden_size() {
+        let device = candle::Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.hidden_size = 5;
+        cfg.conf_num_attention_heads = 1;
+        assert_err_contains(
+            AudioModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("audio")),
+            "hidden_size must be even",
+        );
+    }
+
+    #[test]
+    fn audio_model_rejects_zero_attention_chunk_size() {
+        let device = candle::Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.conf_attention_chunk_size = 0;
+        assert_err_contains(
+            AudioModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("audio")),
+            "conf_attention_chunk_size must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn audio_model_rejects_short_sscp_channel_config() {
+        let device = candle::Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.sscp_conv_channel_size = vec![2];
+        assert_err_contains(
+            AudioModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("audio")),
+            "sscp_conv_channel_size must contain at least 2 entries",
+        );
+    }
+
+    #[test]
+    fn audio_model_rejects_short_sscp_kernel_config() {
+        let device = candle::Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.sscp_conv_kernel_size = vec![vec![3, 3]];
+        assert_err_contains(
+            AudioModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("audio")),
+            "sscp_conv_kernel_size must contain at least 2 entries",
+        );
+    }
+
+    #[test]
+    fn audio_model_rejects_zero_sscp_stride() {
+        let device = candle::Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.sscp_conv_stride_size[0][1] = 0;
+        assert_err_contains(
+            AudioModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("audio")),
+            "sscp_conv_stride_size entries must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn audio_model_rejects_oversized_sscp_kernel() {
+        let device = candle::Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.input_feat_size = 1;
+        cfg.sscp_conv_kernel_size[0][1] = 5;
+        assert_err_contains(
+            AudioModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("audio")),
+            "must fit padded frequency dimension",
+        );
+    }
+
+    #[test]
+    fn audio_model_rejects_zero_conformer_conv_kernel() {
+        let device = candle::Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.conf_conv_kernel_size = 0;
+        assert_err_contains(
+            AudioModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("audio")),
+            "conf_conv_kernel_size must be greater than zero",
+        );
     }
 }
