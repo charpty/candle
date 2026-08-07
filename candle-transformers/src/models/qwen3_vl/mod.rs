@@ -19,6 +19,67 @@ pub struct Qwen3VLModel {
     vision: Qwen3VLVisionModel,
 }
 
+fn validate_sequence_metadata(
+    batch_size: usize,
+    seqlens: &[usize],
+    seqlen_offsets: &[usize],
+) -> Result<()> {
+    if seqlen_offsets.is_empty() {
+        candle::bail!("seqlen_offsets must not be empty");
+    }
+    if seqlen_offsets.len() != batch_size {
+        candle::bail!(
+            "seqlen_offsets length ({}) must match batch size ({})",
+            seqlen_offsets.len(),
+            batch_size
+        );
+    }
+    if seqlens.is_empty() {
+        candle::bail!("seqlens must not be empty");
+    }
+    if seqlens.len() != batch_size {
+        candle::bail!(
+            "seqlens length ({}) must match batch size ({})",
+            seqlens.len(),
+            batch_size
+        );
+    }
+    Ok(())
+}
+
+fn validate_placeholder_spans(
+    spans_by_batch: &[Vec<(usize, usize)>],
+    batch_size: usize,
+    seq_len: usize,
+    kind: &str,
+) -> Result<usize> {
+    if spans_by_batch.len() > batch_size {
+        candle::bail!(
+            "{kind} placeholder span batches ({}) must not exceed batch size ({})",
+            spans_by_batch.len(),
+            batch_size
+        );
+    }
+
+    let mut total = 0usize;
+    for spans in spans_by_batch {
+        for &(start, end) in spans {
+            if start > end {
+                candle::bail!("{kind} placeholder span start ({start}) must be <= end ({end})");
+            }
+            if end > seq_len {
+                candle::bail!(
+                    "{kind} placeholder span end ({end}) exceeds sequence length ({seq_len})"
+                );
+            }
+            total = total.checked_add(end - start).ok_or_else(|| {
+                candle::Error::Msg(format!("{kind} placeholder span total length overflow"))
+            })?;
+        }
+    }
+    Ok(total)
+}
+
 impl Qwen3VLModel {
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
         let vision = Qwen3VLVisionModel::new(&cfg.vision_config, vb.pp("model").pp("visual"))?;
@@ -67,6 +128,7 @@ impl Qwen3VLModel {
         seqlen_offsets: &[usize],
     ) -> Result<Tensor> {
         let (bs, seqlen) = input_ids.dims2()?;
+        validate_sequence_metadata(bs, &seqlens, seqlen_offsets)?;
         let attention_mask = if seqlen <= 1 {
             Some(self.prepare_decoder_attention_mask(
                 bs,
@@ -92,6 +154,8 @@ impl Qwen3VLModel {
             let Some(image_grid_thw_ref) = image_grid_thw.as_ref() else {
                 candle::bail!("pixel_values require image_grid_thw");
             };
+            let total_expected =
+                validate_placeholder_spans(&continuous_img_pad, batch_size, seq_len, "image")?;
             let mut pixel_values = pixel_values.clone();
             let dims = pixel_values.dims();
             if dims.len() == 3 {
@@ -108,10 +172,6 @@ impl Qwen3VLModel {
             let mut offset = 0usize;
             let mut image_mask =
                 Tensor::zeros((batch_size, seq_len), DType::F32, input_ids.device())?;
-            let total_expected: usize = continuous_img_pad
-                .iter()
-                .flat_map(|spans| spans.iter().map(|(s, e)| e - s))
-                .sum();
             if image_embeds.dim(0)? != total_expected {
                 candle::bail!(
                     "Image embedding length {} does not match placeholder tokens {}",
@@ -141,6 +201,8 @@ impl Qwen3VLModel {
             let Some(video_grid_thw_ref) = video_grid_thw.as_ref() else {
                 candle::bail!("pixel_values_videos require video_grid_thw");
             };
+            let total_expected =
+                validate_placeholder_spans(&continuous_vid_pad, batch_size, seq_len, "video")?;
             let mut pixel_values = pixel_values_videos.clone();
             let dims = pixel_values.dims();
             if dims.len() == 3 {
@@ -157,10 +219,6 @@ impl Qwen3VLModel {
             let mut offset = 0usize;
             let mut video_mask =
                 Tensor::zeros((batch_size, seq_len), DType::F32, input_ids.device())?;
-            let total_expected: usize = continuous_vid_pad
-                .iter()
-                .flat_map(|spans| spans.iter().map(|(s, e)| e - s))
-                .sum();
             if video_embeds.dim(0)? != total_expected {
                 candle::bail!(
                     "Video embedding length {} does not match placeholder tokens {}",
@@ -266,5 +324,209 @@ impl Qwen3VLModel {
             deepstack_visual_embeds.as_deref(),
         )?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::Activation;
+
+    fn tiny_config() -> Config {
+        Config {
+            text_config: config::TextConfig {
+                head_dim: 2,
+                vocab_size: 8,
+                hidden_size: 4,
+                intermediate_size: 8,
+                num_hidden_layers: 0,
+                num_attention_heads: 2,
+                num_key_value_heads: 1,
+                hidden_act: Activation::Gelu,
+                max_position_embeddings: 8,
+                rms_norm_eps: 1e-6,
+                tie_word_embeddings: true,
+                rope_theta: 10000.0,
+                sliding_window: None,
+            },
+            vision_config: config::VisionConfig {
+                depth: 0,
+                hidden_size: 4,
+                out_hidden_size: 4,
+                hidden_act: Activation::Gelu,
+                intermediate_size: 8,
+                num_heads: 2,
+                in_chans: 3,
+                patch_size: 1,
+                spatial_merge_size: 1,
+                temporal_patch_size: 2,
+                num_position_embeddings: 1,
+                deepstack_visual_indexes: Vec::new(),
+            },
+            image_token_id: 1,
+            video_token_id: 2,
+            vision_start_token_id: 3,
+            vision_end_token_id: 4,
+        }
+    }
+
+    fn new_model(device: &Device) -> Result<Qwen3VLModel> {
+        let vb = VarBuilder::zeros(DType::F32, device);
+        Qwen3VLModel::new(&tiny_config(), vb)
+    }
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn model_rejects_empty_seqlen_offsets() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let input_ids = Tensor::zeros((1, 1), DType::U32, &device)?;
+
+        assert_err_contains(
+            model.forward(
+                &input_ids,
+                None,
+                None,
+                None,
+                None,
+                vec![1],
+                vec![Vec::new()],
+                vec![Vec::new()],
+                &[],
+            ),
+            "seqlen_offsets",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_rejects_seqlen_offsets_batch_mismatch() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let input_ids = Tensor::zeros((2, 2), DType::U32, &device)?;
+
+        assert_err_contains(
+            model.forward(
+                &input_ids,
+                None,
+                None,
+                None,
+                None,
+                vec![2, 2],
+                vec![Vec::new(), Vec::new()],
+                vec![Vec::new(), Vec::new()],
+                &[0],
+            ),
+            "seqlen_offsets",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_rejects_empty_seqlens() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let input_ids = Tensor::zeros((1, 2), DType::U32, &device)?;
+
+        assert_err_contains(
+            model.forward(
+                &input_ids,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                vec![Vec::new()],
+                vec![Vec::new()],
+                &[0],
+            ),
+            "seqlens",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_rejects_seqlens_batch_mismatch() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let input_ids = Tensor::zeros((2, 2), DType::U32, &device)?;
+
+        assert_err_contains(
+            model.forward(
+                &input_ids,
+                None,
+                None,
+                None,
+                None,
+                vec![2],
+                vec![Vec::new(), Vec::new()],
+                vec![Vec::new(), Vec::new()],
+                &[0, 0],
+            ),
+            "seqlens",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_rejects_reversed_image_placeholder_span() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let input_ids = Tensor::zeros((1, 2), DType::U32, &device)?;
+        let pixel_values = Tensor::zeros((1, 6), DType::F32, &device)?;
+        let image_grid_thw = Tensor::new(&[[1u32, 1, 1]], &device)?;
+
+        assert_err_contains(
+            model.forward(
+                &input_ids,
+                Some(pixel_values),
+                None,
+                Some(image_grid_thw),
+                None,
+                vec![2],
+                vec![vec![(1, 0)]],
+                vec![Vec::new()],
+                &[0],
+            ),
+            "image placeholder span",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_rejects_reversed_video_placeholder_span() -> Result<()> {
+        let device = Device::Cpu;
+        let model = new_model(&device)?;
+        let input_ids = Tensor::zeros((1, 2), DType::U32, &device)?;
+        let pixel_values_videos = Tensor::zeros((1, 6), DType::F32, &device)?;
+        let video_grid_thw = Tensor::new(&[[1u32, 1, 1]], &device)?;
+
+        assert_err_contains(
+            model.forward(
+                &input_ids,
+                None,
+                Some(pixel_values_videos),
+                None,
+                Some(video_grid_thw),
+                vec![2],
+                vec![Vec::new()],
+                vec![vec![(1, 0)]],
+                &[0],
+            ),
+            "video placeholder span",
+        );
+        Ok(())
     }
 }
