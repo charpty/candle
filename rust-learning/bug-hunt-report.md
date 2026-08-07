@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：九十七个 public API 边界修复
+# Candle bug hunt 报告：一百零七个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复九十七个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百零七个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -14,7 +14,8 @@ Qwen3-VL vision 构造期配置；BUG-070 到 BUG-074 覆盖 Qwen3-VL text atten
 forward 边界；BUG-075 到 BUG-080 覆盖 Qwen3-VL 外层 forward 的 per-batch 元数据和 image/video
 placeholder span 合同；BUG-081 到 BUG-086 覆盖 Qwen3-VL vision runtime `grid_thw` 合同；
 BUG-087 到 BUG-092 覆盖 PaddleOCR-VL vision 构造期配置；BUG-093 到 BUG-097 覆盖
-PaddleOCR-VL text attention 配置和空序列 forward 合同。
+PaddleOCR-VL text attention 配置和空序列 forward 合同；BUG-098 到 BUG-107 覆盖 PaddleOCR-VL
+vision runtime `grid_thw` 合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -122,6 +123,16 @@ PaddleOCR-VL text attention 配置和空序列 forward 合同。
 | BUG-095 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `num_attention_heads % num_key_value_heads != 0` 时 GQA group 数静默截断 | 要求 attention heads 可被 KV heads 整除 |
 | BUG-096 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `head_dim = 0` 会构造空 RoPE/attention，并让 softmax scale 失去语义 | 构造阶段拒绝零 head dim |
 | BUG-097 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | `[B, 0, H]` 空序列进入 forward 后得到间接 reshape 错误 | `forward_embeds_with_mrope` 入口拒绝空序列 |
+| BUG-098 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `grid_thw` 只有两列时在 RoPE 路径直接切片越界 panic | 要求 `grid_thw` shape 为 `[N, 3]` |
+| BUG-099 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `grid_thw` 多于三列时额外列被静默忽略 | 同样用精确 `[N, 3]` 校验拒绝额外列 |
+| BUG-100 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | 空 `grid_thw` 返回间接 `stack expects at least one tensor` 错误 | forward 入口返回明确 `grid_thw` 错误 |
+| BUG-101 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `t = 0` 进入后续空 stack/reshape 路径 | 校验每行 temporal 必须大于 0 |
+| BUG-102 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `h = 0` 进入后续空 stack/reshape 路径 | 校验每行 height 必须大于 0 |
+| BUG-103 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `w = 0` 进入后续空 stack/reshape 路径 | 校验每行 width 必须大于 0 |
+| BUG-104 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | grid height 不能被 `spatial_merge_size` 整除时 projector 静默丢掉尾部 patch 行 | 入口校验 height 整除关系 |
+| BUG-105 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | grid width 不能被 `spatial_merge_size` 整除时 projector 静默丢掉尾部 patch 列 | 入口校验 width 整除关系 |
+| BUG-106 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | pixel token 行数和 `grid_thw` 派生 token 数不一致时只得到间接 narrow/reshape 错误 | forward 入口校验二者 token count 一致 |
+| BUG-107 | [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs) | `build_cu_seqlens` 用 `u32` 计算 `h * w`，超大 grid 在 debug 下溢出 panic | 使用 `usize` 和 checked arithmetic 计算面积与累计长度 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2069,7 +2080,77 @@ git diff --check
 - `agent/bug-096-paddleocr-vl-text-zero-head-dim`
 - `agent/bug-097-paddleocr-vl-text-empty-sequence`
 
-## 九十七个案例教什么
+## BUG-098 到 BUG-107：PaddleOCR-VL vision runtime grid 合同
+
+受影响文件：
+
+- [candle-transformers/src/models/paddleocr_vl/vision.rs](../candle-transformers/src/models/paddleocr_vl/vision.rs)
+
+PaddleOCR-VL vision 的 public forward 不只接收图像 Tensor，还接收 `grid_thw`。这个 Tensor
+描述每张图的 temporal、height、width patch grid，并同时驱动三条路径：
+
+- `rot_pos_emb` 用它生成 2D RoPE 的行列坐标。
+- `build_cu_seqlens` 用它划分每个 frame 的 attention 序列范围。
+- `Projector::forward` 用它按 `spatial_merge_size` 做 2D patch merge。
+
+原实现的问题是：三条路径都直接 `to_vec2::<u32>()?`，然后假设每行正好三列、t/h/w 都大于 0、
+h/w 能被 merge size 整除、pixel token 总数一定匹配。这些假设没有在入口证明。
+
+修复前 10 个测试的失败形态：
+
+- `[1, 2]` 两列 grid：`v[1..3]` 切片越界 panic。
+- `[1, 2, 2, 99]` 四列 grid：模型返回 `Ok`，第 4 列被完全忽略。
+- 空 grid：返回 `stack expects at least one tensor` 这种内部错误，而不是指向 `grid_thw`。
+- `t = 0`、`h = 0`、`w = 0`：进入空 stack/reshape 路径，错误和调用方输入合同脱节。
+- `h = 3, spatial_merge_size = 2`：projector 只处理前两行 patch，最后一行被静默丢掉。
+- `w = 3, spatial_merge_size = 2`：projector 只处理前两列 patch，最后一列被静默丢掉。
+- pixel rows 为 4、`grid_thw = [1, 2, 4]` 派生 token 数为 8：只得到间接 narrow 错误。
+- `h = 65536, w = 65536`：`build_cu_seqlens` 中 `u32` 乘法在 debug 下溢出 panic。
+
+修复策略：
+
+1. 新增 `validate_grid_thw`，要求 `grid_thw` 精确为 `[N, 3]` 且至少一行。
+2. 拒绝 `t/h/w = 0`，拒绝 `spatial_merge_size = 0`。
+3. 要求 h/w 都能被 `spatial_merge_size` 整除，避免 projector 静默丢 patch。
+4. 使用 `usize` + checked arithmetic 计算每行 area、每行 token 数和总 token 数。
+5. `VisionModel` 在 RoPE、cu_seqlens、projector 前先校验 pixel token 行数等于 `grid_thw` 派生 token 总数。
+6. `Projector::forward` 和 `forward_multi` 也调用同一个 helper，防止直接构造 projector 时绕过总入口。
+
+新增测试：
+
+- `vision_model_rejects_grid_with_too_few_columns`
+- `vision_model_rejects_grid_with_extra_columns`
+- `vision_model_rejects_empty_grid`
+- `vision_model_rejects_zero_temporal_grid`
+- `vision_model_rejects_zero_grid_height`
+- `vision_model_rejects_zero_grid_width`
+- `vision_model_rejects_grid_height_not_divisible_by_merge`
+- `vision_model_rejects_grid_width_not_divisible_by_merge`
+- `vision_model_rejects_pixel_grid_token_count_mismatch`
+- `build_cu_seqlens_uses_usize_grid_area`
+
+修复后验证：
+
+```bash
+cargo test -p candle-transformers models::paddleocr_vl::vision::tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-098-paddleocr-vl-grid-too-few-columns`
+- `agent/bug-099-paddleocr-vl-grid-extra-columns`
+- `agent/bug-100-paddleocr-vl-empty-grid`
+- `agent/bug-101-paddleocr-vl-zero-temporal-grid`
+- `agent/bug-102-paddleocr-vl-zero-grid-height`
+- `agent/bug-103-paddleocr-vl-zero-grid-width`
+- `agent/bug-104-paddleocr-vl-grid-height-merge`
+- `agent/bug-105-paddleocr-vl-grid-width-merge`
+- `agent/bug-106-paddleocr-vl-grid-token-count`
+- `agent/bug-107-paddleocr-vl-grid-area-overflow`
+
+## 一百零七个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
