@@ -1,12 +1,13 @@
-# Candle bug hunt 报告：四十四个 public API 边界修复
+# Candle bug hunt 报告：五十三个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复四十四个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复五十三个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
-这些更贴近模型配置和训练/推理边界的路径。
+这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
+Conformer attention 和 SSCP conv 配置。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -61,6 +62,15 @@
 | BUG-042 | [candle-transformers/src/models/gemma4/text.rs](../candle-transformers/src/models/gemma4/text.rs) | Gemma4 text global `head_dim = 0` 可构造无效 global RoPE | 构造前校验 global head dim |
 | BUG-043 | [candle-transformers/src/models/gemma4/text.rs](../candle-transformers/src/models/gemma4/text.rs) | `partial_rotary_factor > 1` 使 `half_dim - rope_angles` 下溢 panic | 要求 rotary factor 有限且在 `[0, 1]` |
 | BUG-044 | [candle-transformers/src/models/gemma4/text.rs](../candle-transformers/src/models/gemma4/text.rs) | `TextModel::forward` 空 token 序列在 `seq_len - 1` 下溢 | forward / forward_embeds 拒绝空序列 |
+| BUG-045 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | Gemma4 audio `conf_num_attention_heads = 0` 在 head dim 计算中除零 | audio attention 构造前校验 heads 非零 |
+| BUG-046 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | `hidden_size % conf_num_attention_heads != 0` 时 head dim 静默截断 | 要求 hidden size 可被 heads 整除 |
+| BUG-047 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | odd `hidden_size` 让 relative position sin/cos 维度少一列 | 要求 hidden size 为偶数 |
+| BUG-048 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | `conf_attention_chunk_size = 0` 使 block 转换路径后续 `div_ceil(0)` | 构造阶段拒绝零 chunk size |
+| BUG-049 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | `sscp_conv_channel_size` 少于两层时构造直接索引越界 | 校验 SSCP channel 配置长度 |
+| BUG-050 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | `sscp_conv_kernel_size` 少于两层或内层少 time/freq 时索引越界 | 校验 SSCP kernel 配置形状 |
+| BUG-051 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | SSCP stride 为 0 时 frequency 输出计算除零 | 校验 stride time/freq 都大于 0 |
+| BUG-052 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | SSCP frequency kernel 大于 padded frequency 时 `usize` 下溢 | 构造阶段检查 kernel 能放入 padded frequency |
+| BUG-053 | [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs) | `conf_conv_kernel_size = 0` 使 light conv causal padding 下溢 | 构造阶段拒绝零 conformer conv kernel |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -1348,7 +1358,105 @@ cargo test -p candle-transformers models::gemma4::text::tests
 - `agent/bug-043-gemma4-text-invalid-rotary-factor`
 - `agent/bug-044-gemma4-text-empty-input-sequence`
 
-## 四十四个案例教什么
+## BUG-045 到 BUG-053：Gemma4 audio Conformer 配置
+
+受影响文件：
+
+- [candle-transformers/src/models/gemma4/audio.rs](../candle-transformers/src/models/gemma4/audio.rs)
+
+Gemma4 audio 的结构比 text/vision 更容易出边界问题，因为它同时有：
+
+- SSCP 两层 2D conv projection。
+- Conformer attention 的 chunk/block/context 计算。
+- relative position embedding。
+- light conv1d 的 causal padding。
+
+这些组件都从 config 派生 shape，因此 public `AudioModel::new` 必须先校验配置，再进入权重 shape
+构造或后续 forward。
+
+### Attention 与 relative position embedding
+
+原实现直接计算：
+
+```rust
+let head_dim = channels / num_heads;
+```
+
+这带来三个边界：
+
+- `num_heads = 0` 除零。
+- `hidden_size % num_heads != 0` 时 head dim 被截断，Q/K/V reshape 语义错误。
+- `hidden_size` 为奇数时，relative position embedding 的 sin/cos 拼接只有 `hidden_size - 1` 列，
+  但 `pos_proj` 期望输入维度仍是 `hidden_size`。
+
+修复后 `validate_audio_attention_config` 要求：
+
+- `hidden_size > 0`
+- `hidden_size` 为偶数
+- `conf_num_attention_heads > 0`
+- `hidden_size % conf_num_attention_heads == 0`
+- `conf_attention_chunk_size > 0`
+
+### SSCP conv projection
+
+SSCP projection 写死使用两层 conv：
+
+```rust
+for i in 0..2 {
+    let kernel_w = cfg.sscp_conv_kernel_size[i][1];
+    let stride_w = cfg.sscp_conv_stride_size[i][1];
+    let f_out = (f_in_padded - kernel_w) / stride_w + 1;
+}
+```
+
+所以配置数组的长度、内层长度、stride 和 kernel 都必须提前检查：
+
+- channel/kernel/stride 配置至少有两层。
+- kernel/stride 每层至少包含 time 和 frequency 两个值。
+- kernel 和 stride 都大于 0。
+- frequency kernel 不能大于当前 padded frequency，否则 `f_in_padded - kernel_w` 下溢。
+
+### Light conv kernel
+
+Conformer light conv 原来计算：
+
+```rust
+causal_padding: cfg.conf_conv_kernel_size - 1
+```
+
+`conf_conv_kernel_size = 0` 会直接下溢。修复后构造阶段拒绝零 kernel。
+
+新增测试：
+
+- `audio_model_rejects_zero_attention_heads`
+- `audio_model_rejects_non_divisible_attention_heads`
+- `audio_model_rejects_odd_hidden_size`
+- `audio_model_rejects_zero_attention_chunk_size`
+- `audio_model_rejects_short_sscp_channel_config`
+- `audio_model_rejects_short_sscp_kernel_config`
+- `audio_model_rejects_zero_sscp_stride`
+- `audio_model_rejects_oversized_sscp_kernel`
+- `audio_model_rejects_zero_conformer_conv_kernel`
+
+已运行：
+
+```bash
+cargo test -p candle-transformers models::gemma4::audio::tests
+```
+
+分支：
+
+- `agent/bug-045-gemma4-audio-zero-attention-heads`
+- `agent/bug-046-gemma4-audio-head-divisibility`
+- `agent/bug-047-gemma4-audio-odd-hidden-size`
+- `agent/bug-048-gemma4-audio-zero-chunk-size`
+- `agent/bug-049-gemma4-audio-short-sscp-channels`
+- `agent/bug-050-gemma4-audio-short-sscp-kernels`
+- `agent/bug-051-gemma4-audio-zero-sscp-stride`
+- `agent/bug-052-gemma4-audio-oversized-sscp-kernel`
+- `agent/bug-053-gemma4-audio-zero-conv-kernel`
+
+## 五十三个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 

@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：44 个 public API 边界</h2>
+          <h2>真实修复：53 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -277,6 +277,10 @@
             <p>Gemma4 text 按 layer 类型校验 local/global KV heads 和 head dim，拒绝非法 RoPE factor 与空 token 序列。</p>
           </article>
           <article class="bug-card">
+            <h3>BUG-045/053</h3>
+            <p>Gemma4 audio 校验 Conformer heads/chunk、relative position hidden size、SSCP conv 数组和 light conv kernel。</p>
+          </article>
+          <article class="bug-card">
             <h3>审计方法</h3>
             <p>先看 public API 签名，再找 `usize` 除法/减法、index、`unwrap()`、shape 假设、配置派生和失败半更新。</p>
           </article>
@@ -295,6 +299,7 @@
           <pre><code>cargo test -p candle-transformers models::mimi::transformer::tests</code></pre>
           <pre><code>cargo test -p candle-transformers models::gemma4::vision::tests</code></pre>
           <pre><code>cargo test -p candle-transformers models::gemma4::text::tests</code></pre>
+          <pre><code>cargo test -p candle-transformers models::gemma4::audio::tests</code></pre>
         </div>
       </section>
 
