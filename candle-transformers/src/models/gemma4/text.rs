@@ -9,6 +9,71 @@ use candle_nn::{linear_b as linear_bias, Activation, Linear, VarBuilder};
 
 use super::config::Gemma4TextConfig;
 
+fn validate_head_dim(name: &str, head_dim: usize) -> Result<()> {
+    if head_dim == 0 {
+        candle::bail!("{name} must be greater than zero")
+    }
+    Ok(())
+}
+
+fn validate_partial_rotary_factor(partial_rotary_factor: f64) -> Result<()> {
+    if !partial_rotary_factor.is_finite() || !(0.0..=1.0).contains(&partial_rotary_factor) {
+        candle::bail!(
+            "partial_rotary_factor must be finite and between 0 and 1, got {partial_rotary_factor}"
+        )
+    }
+    Ok(())
+}
+
+fn validate_key_value_heads(num_heads: usize, num_kv_heads: usize) -> Result<()> {
+    if num_heads == 0 {
+        candle::bail!("num_attention_heads must be greater than zero")
+    }
+    if num_kv_heads == 0 {
+        candle::bail!("num_key_value_heads must be greater than zero")
+    }
+    if num_heads % num_kv_heads != 0 {
+        candle::bail!(
+            "num_attention_heads must be divisible by num_key_value_heads, got num_attention_heads={num_heads} and num_key_value_heads={num_kv_heads}"
+        )
+    }
+    Ok(())
+}
+
+fn attention_head_dim_and_kv_heads(cfg: &Gemma4TextConfig, layer_idx: usize) -> (usize, usize) {
+    if cfg.is_sliding(layer_idx) {
+        (cfg.head_dim, cfg.num_key_value_heads)
+    } else {
+        let global_kv = cfg
+            .num_global_key_value_heads
+            .unwrap_or(cfg.num_key_value_heads);
+        (cfg.global_head_dim, global_kv)
+    }
+}
+
+fn validate_attention_config(cfg: &Gemma4TextConfig, layer_idx: usize) -> Result<()> {
+    let (head_dim, num_kv_heads) = attention_head_dim_and_kv_heads(cfg, layer_idx);
+    validate_head_dim("head_dim", head_dim)?;
+    validate_key_value_heads(cfg.num_attention_heads, num_kv_heads)
+}
+
+fn validate_text_config(cfg: &Gemma4TextConfig) -> Result<()> {
+    validate_head_dim("head_dim", cfg.head_dim)?;
+    validate_head_dim("global_head_dim", cfg.global_head_dim)?;
+    validate_partial_rotary_factor(cfg.partial_rotary_factor())?;
+    for layer_idx in 0..cfg.num_hidden_layers {
+        validate_attention_config(cfg, layer_idx)?;
+    }
+    Ok(())
+}
+
+fn validate_sequence_len(seq_len: usize) -> Result<()> {
+    if seq_len == 0 {
+        candle::bail!("input sequence length must be greater than zero")
+    }
+    Ok(())
+}
+
 // ── RmsNorm (Gemma-style with +1 offset) ────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -66,6 +131,7 @@ impl RotaryEmbedding {
         max_seq_len: usize,
         dev: &Device,
     ) -> Result<Self> {
+        validate_head_dim("head_dim", head_dim)?;
         let inv_freq: Vec<_> = (0..head_dim)
             .step_by(2)
             .map(|i| 1f32 / rope_theta.powf(i as f64 / head_dim as f64) as f32)
@@ -114,6 +180,8 @@ impl ProportionalRotaryEmbedding {
         max_seq_len: usize,
         dev: &Device,
     ) -> Result<Self> {
+        validate_head_dim("head_dim", head_dim)?;
+        validate_partial_rotary_factor(partial_rotary_factor)?;
         let rope_angles = (partial_rotary_factor * head_dim as f64 / 2.0) as usize;
         let half_dim = head_dim / 2;
 
@@ -246,19 +314,13 @@ impl Attention {
         layer_idx: usize,
         vb: VarBuilder,
     ) -> Result<Self> {
+        validate_attention_config(cfg, layer_idx)?;
         let hidden_sz = cfg.hidden_size;
         let num_heads = cfg.num_attention_heads;
         let bias = cfg.attention_bias;
         let is_sliding = cfg.is_sliding(layer_idx);
 
-        let (head_dim, num_kv_heads) = if is_sliding {
-            (cfg.head_dim, cfg.num_key_value_heads)
-        } else {
-            let global_kv = cfg
-                .num_global_key_value_heads
-                .unwrap_or(cfg.num_key_value_heads);
-            (cfg.global_head_dim, global_kv)
-        };
+        let (head_dim, num_kv_heads) = attention_head_dim_and_kv_heads(cfg, layer_idx);
 
         let num_kv_groups = num_heads / num_kv_heads;
         let q_proj = linear_bias(hidden_sz, num_heads * head_dim, bias, vb.pp("q_proj"))?;
@@ -529,6 +591,7 @@ pub struct TextModel {
 
 impl TextModel {
     pub fn new(cfg: &Gemma4TextConfig, vb: VarBuilder) -> Result<Self> {
+        validate_text_config(cfg)?;
         let vb_m = vb.pp("model");
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
@@ -615,6 +678,7 @@ impl TextModel {
 
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (b_size, seq_len) = input_ids.dims2()?;
+        validate_sequence_len(seq_len)?;
         let xs = self.embed_tokens(input_ids)?;
         self.forward_embeds(&xs, seqlen_offset, b_size, seq_len)
     }
@@ -626,6 +690,7 @@ impl TextModel {
         batch_size: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
+        validate_sequence_len(seq_len)?;
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(batch_size, seq_len, seqlen_offset)?;
 
@@ -652,5 +717,142 @@ impl TextModel {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::{Activation, VarBuilder};
+
+    fn tiny_config() -> Gemma4TextConfig {
+        Gemma4TextConfig {
+            attention_bias: false,
+            head_dim: 4,
+            hidden_activation: Activation::GeluPytorchTanh,
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_attention_heads: 2,
+            num_hidden_layers: 1,
+            num_key_value_heads: 1,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            vocab_size: 8,
+            sliding_window: 4,
+            final_logit_softcapping: None,
+            query_pre_attn_scalar: 4,
+            max_position_embeddings: 8,
+            tie_word_embeddings: true,
+            sliding_window_pattern: 6,
+            layer_types: vec!["full_attention".to_string()],
+            global_head_dim: 4,
+            num_global_key_value_heads: None,
+            rope_parameters: None,
+            use_bidirectional_attention: None,
+            use_flash_attn: false,
+        }
+    }
+
+    fn assert_err_contains<T: std::fmt::Debug>(result: Result<T>, expected: &str) {
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(expected),
+            "expected error containing {expected:?}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn text_model_rejects_zero_sliding_key_value_heads() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.layer_types = vec!["sliding_attention".to_string()];
+        cfg.num_key_value_heads = 0;
+        assert_err_contains(
+            TextModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("text")),
+            "num_key_value_heads must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn text_model_rejects_non_divisible_key_value_heads() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.layer_types = vec!["sliding_attention".to_string()];
+        cfg.num_attention_heads = 3;
+        cfg.num_key_value_heads = 2;
+        assert_err_contains(
+            TextModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("text")),
+            "num_attention_heads must be divisible by num_key_value_heads",
+        );
+    }
+
+    #[test]
+    fn text_model_rejects_zero_global_key_value_heads() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.num_global_key_value_heads = Some(0);
+        assert_err_contains(
+            TextModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("text")),
+            "num_key_value_heads must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn text_model_rejects_zero_local_head_dim() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.layer_types = vec!["sliding_attention".to_string()];
+        cfg.head_dim = 0;
+        assert_err_contains(
+            TextModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("text")),
+            "head_dim must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn text_model_rejects_zero_global_head_dim() {
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.global_head_dim = 0;
+        assert_err_contains(
+            TextModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("text")),
+            "global_head_dim must be greater than zero",
+        );
+    }
+
+    #[test]
+    fn text_model_rejects_invalid_partial_rotary_factor() {
+        use super::super::config::{Gemma4RopeLayerParams, Gemma4RopeParameters};
+
+        let device = Device::Cpu;
+        let mut cfg = tiny_config();
+        cfg.rope_parameters = Some(Gemma4RopeParameters {
+            full_attention: Some(Gemma4RopeLayerParams {
+                rope_theta: None,
+                rope_type: None,
+                partial_rotary_factor: Some(1.5),
+            }),
+            sliding_attention: None,
+            rope_theta: None,
+            rope_type: None,
+            partial_rotary_factor: None,
+        });
+        assert_err_contains(
+            TextModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("text")),
+            "partial_rotary_factor must be finite and between 0 and 1",
+        );
+    }
+
+    #[test]
+    fn text_model_rejects_empty_input_sequence() -> Result<()> {
+        let device = Device::Cpu;
+        let cfg = tiny_config();
+        let mut model = TextModel::new(&cfg, VarBuilder::zeros(DType::F32, &device).pp("text"))?;
+        let input_ids = Tensor::zeros((1, 0), DType::U32, &device)?;
+        assert_err_contains(
+            model.forward(&input_ids, 0),
+            "input sequence length must be greater than zero",
+        );
+        Ok(())
     }
 }
