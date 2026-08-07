@@ -1,15 +1,16 @@
-# Candle bug hunt 报告：六十二个 public API 边界修复
+# Candle bug hunt 报告：六十九个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复六十二个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复六十九个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
 和 mask 对齐语义；BUG-057 到 BUG-059 覆盖 Gemma4 audio forward 输入合同；BUG-060 到 BUG-062
-继续覆盖 Gemma4 multimodal/vision 的运行期数量和 pooling 边界。
+继续覆盖 Gemma4 multimodal/vision 的运行期数量和 pooling 边界；BUG-063 到 BUG-069 覆盖
+Qwen3-VL vision 构造期配置。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -82,6 +83,13 @@ Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 mul
 | BUG-060 | [candle-transformers/src/models/gemma4/mod.rs](../candle-transformers/src/models/gemma4/mod.rs) | encoder 产生 multimodal embedding 但 prompt 没有对应特殊 token 时静默丢特征 | 即使 mask token 数为 0，也校验 embedding 数量一致 |
 | BUG-061 | [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs) | 图像太小导致 `num_patches / (pooling_kernel_size^2) == 0`，pooling 输出无效 | `VisionTower::encode_single` 拒绝零输出 token |
 | BUG-062 | [candle-transformers/src/models/gemma4/vision.rs](../candle-transformers/src/models/gemma4/vision.rs) | `VisionPooler::forward(..., Some(0))` 会进入除零/无效 pooling | pooler 入口拒绝 `output_length = 0` |
+| BUG-063 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | Qwen3-VL vision `num_heads = 0` 构造期除零 | 构造阶段拒绝零 heads |
+| BUG-064 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `hidden_size % num_heads != 0` 时 head dim 静默截断 | 要求 hidden size 可被 heads 整除 |
+| BUG-065 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | RoPE head dim 非 4 的倍数时 cos/sin 维度与 Q/K head dim 错配 | 要求 vision head_dim 是 4 的非零倍数 |
+| BUG-066 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `patch_size = 0` 会进入 Conv3D stride/reshape 非法配置 | 构造阶段拒绝零 patch |
+| BUG-067 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `temporal_patch_size = 0` 会进入 Conv3D kernel/reshape 非法配置 | 构造阶段拒绝零 temporal patch |
+| BUG-068 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `spatial_merge_size = 0` 使 merger 后续取模/除法为 0 | 构造阶段拒绝零 spatial merge |
+| BUG-069 | [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs) | `num_position_embeddings = 0` 被当作平方数接受，后续 grid 插值会下溢 | 构造阶段拒绝零 position embeddings |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -1632,7 +1640,65 @@ cargo test -p candle-transformers models::gemma4::vision::tests
 - `agent/bug-061-gemma4-vision-empty-pooling-output`
 - `agent/bug-062-gemma4-vision-zero-pooler-output-length`
 
-## 六十二个案例教什么
+## BUG-063 到 BUG-069：Qwen3-VL vision 构造期配置
+
+受影响文件：
+
+- [candle-transformers/src/models/qwen3_vl/vision.rs](../candle-transformers/src/models/qwen3_vl/vision.rs)
+
+Qwen3-VL vision 有多处从 config 派生 shape 的代码：
+
+```rust
+let head_dim = cfg.hidden_size / cfg.num_heads;
+VisionRotaryEmbedding::new(head_dim / 2, device)?;
+cfg.spatial_merge_size.pow(2)
+Conv3dNoBias::new(..., [temporal_patch_size, patch_size, patch_size], stride = patch_size)
+```
+
+这些字段如果不在构造期校验，会导致三类问题：
+
+- 直接除零或取模零。
+- 整数除法静默截断 head dim。
+- RoPE cos/sin 维度和 Q/K head dim 对不上，错误延迟到 forward。
+
+修复策略：
+
+- `hidden_size > 0`
+- `num_heads > 0`
+- `hidden_size % num_heads == 0`
+- `head_dim` 是 4 的非零倍数，因为 vision RoPE 会先构造 `head_dim / 2` 的二维频率，再拼回 Q/K head。
+- `patch_size > 0`
+- `temporal_patch_size > 0`
+- `spatial_merge_size > 0`，并检查平方不溢出。
+- `num_position_embeddings > 0`，原有 perfect square 检查继续保留。
+
+新增测试：
+
+- `vision_model_rejects_zero_num_heads`
+- `vision_model_rejects_hidden_size_not_divisible_by_heads`
+- `vision_model_rejects_invalid_rotary_head_dim`
+- `vision_model_rejects_zero_patch_size`
+- `vision_model_rejects_zero_temporal_patch_size`
+- `vision_model_rejects_zero_spatial_merge_size`
+- `vision_model_rejects_zero_position_embeddings`
+
+已运行：
+
+```bash
+cargo test -p candle-transformers models::qwen3_vl::vision::tests
+```
+
+分支：
+
+- `agent/bug-063-qwen3-vl-vision-zero-heads`
+- `agent/bug-064-qwen3-vl-vision-head-divisibility`
+- `agent/bug-065-qwen3-vl-vision-invalid-rope-head-dim`
+- `agent/bug-066-qwen3-vl-vision-zero-patch-size`
+- `agent/bug-067-qwen3-vl-vision-zero-temporal-patch`
+- `agent/bug-068-qwen3-vl-vision-zero-spatial-merge`
+- `agent/bug-069-qwen3-vl-vision-zero-position-embeddings`
+
+## 六十九个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 

@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：62 个 public API 边界</h2>
+          <h2>真实修复：69 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -293,6 +293,10 @@
             <p>Gemma4 继续收紧 multimodal token 数量合同，并拒绝 vision pooling 派生出的 0 输出 token。</p>
           </article>
           <article class="bug-card">
+            <h3>BUG-063/069</h3>
+            <p>Qwen3-VL vision 在构造期校验 heads、patch、temporal patch、spatial merge、RoPE head dim 和 position grid。</p>
+          </article>
+          <article class="bug-card">
             <h3>审计方法</h3>
             <p>先看 public API 签名，再找 `usize` 除法/减法、index、`unwrap()`、shape 假设、配置派生和失败半更新。</p>
           </article>
@@ -313,6 +317,7 @@
           <pre><code>cargo test -p candle-transformers models::gemma4::text::tests</code></pre>
           <pre><code>cargo test -p candle-transformers models::gemma4::audio::tests</code></pre>
           <pre><code>cargo test -p candle-transformers models::gemma4::tests</code></pre>
+          <pre><code>cargo test -p candle-transformers models::qwen3_vl::vision::tests</code></pre>
         </div>
       </section>
 
