@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百三十二个 public API 边界修复
+# Candle bug hunt 报告：一百三十四个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百三十二个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百三十四个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -18,7 +18,8 @@ PaddleOCR-VL text attention 配置和空序列 forward 合同；BUG-098 到 BUG-
 vision runtime `grid_thw` 合同；BUG-108 到 BUG-116 覆盖 PaddleOCR-VL text M-RoPE 运行期输入合同；
 BUG-117 到 BUG-124 覆盖 PaddleOCR-VL video M-RoPE 运行期输入合同；BUG-125 到 BUG-128 覆盖
 PaddleOCR-VL glue 层多模态输入配对和列表长度合同；BUG-129 到 BUG-132 覆盖 Qwen3-VL
-多模态元数据和 placeholder span 半配对合同。
+多模态元数据和 placeholder span 半配对合同；BUG-133 到 BUG-134 覆盖 Stable Diffusion
+UNet/VAE 构造期空 block 配置。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -161,6 +162,8 @@ PaddleOCR-VL glue 层多模态输入配对和列表长度合同；BUG-129 到 BU
 | BUG-130 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `video_grid_thw` 存在但 `pixel_values_videos` 缺席时被静默忽略 | video grid 和 video pixels 必须成对提供 |
 | BUG-131 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `continuous_img_pad` 非空但没有 image pixels 时仍走纯文本路径 | 没有 image pixels 时拒绝 image placeholder span |
 | BUG-132 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `continuous_vid_pad` 非空但没有 video pixels 时仍走纯文本路径 | 没有 video pixels 时拒绝 video placeholder span |
+| BUG-133 | [candle-transformers/src/models/stable_diffusion/unet_2d.rs](../candle-transformers/src/models/stable_diffusion/unet_2d.rs) | `UNet2DConditionModel::new` 对空 `blocks` 直接索引/unwrap panic | 构造入口拒绝空 `blocks` |
+| BUG-134 | [candle-transformers/src/models/stable_diffusion/vae.rs](../candle-transformers/src/models/stable_diffusion/vae.rs) | `AutoEncoderKL::new` 对空 `block_out_channels` 直接索引/unwrap panic | 构造入口拒绝空 `block_out_channels` |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2409,7 +2412,50 @@ git diff --check
 - `agent/bug-131-qwen3-vl-image-spans-without-pixels`
 - `agent/bug-132-qwen3-vl-video-spans-without-pixels`
 
-## 一百三十二个案例教什么
+## BUG-133 到 BUG-134：Stable Diffusion UNet/VAE 空 block 配置
+
+受影响文件：
+
+- [candle-transformers/src/models/stable_diffusion/unet_2d.rs](../candle-transformers/src/models/stable_diffusion/unet_2d.rs)
+- [candle-transformers/src/models/stable_diffusion/vae.rs](../candle-transformers/src/models/stable_diffusion/vae.rs)
+
+这一组回到 diffusion 模型构造期配置。`UNet2DConditionModel::new` 和 `AutoEncoderKL::new`
+都返回 `Result<Self>`，但旧实现假设 block 列表非空，直接用 `config.blocks[0]`、
+`config.blocks.last().unwrap()` 或 `config.block_out_channels[0]`。
+
+空 block 列表不是内部不变量破坏，而是调用方可能传入的普通非法配置。对 public 构造函数来说，
+正确行为应该是返回明确 `Err`，而不是让测试进程或服务进程在 index/unwrap 上 panic。
+
+修复前 2 个测试的失败形态：
+
+- `UNet2DConditionModelConfig { blocks: vec![], .. }` 在 `config.blocks[0]` 处 panic。
+- `AutoEncoderKLConfig { block_out_channels: vec![], .. }` 在 encoder 构造时 panic。
+
+修复策略：
+
+1. 在 UNet 构造入口先拒绝空 `blocks`。
+2. 在 VAE 构造入口先拒绝空 `block_out_channels`。
+3. 用 `VarBuilder::zeros` 做构造期 UT，测试只验证 config 合同，不依赖 checkpoint。
+
+新增测试：
+
+- `models::stable_diffusion::unet_2d::tests::new_rejects_empty_blocks`
+- `models::stable_diffusion::vae::tests::new_rejects_empty_block_out_channels`
+
+修复后验证：
+
+```bash
+cargo test -p candle-transformers models::stable_diffusion::
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-133-stable-diffusion-unet-empty-blocks`
+- `agent/bug-134-stable-diffusion-vae-empty-block-channels`
+
+## 一百三十四个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 

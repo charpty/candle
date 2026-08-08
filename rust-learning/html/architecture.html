@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：132 个 public API 边界</h2>
+          <h2>真实修复：134 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -263,6 +263,10 @@
           <article class="bug-card">
             <h3>BUG-021/023</h3>
             <p>BatchNorm 拒绝单样本训练态统计，loss 函数在入口处理空 batch 和非法 Huber `delta`。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-133/134</h3>
+            <p>Stable Diffusion UNet/VAE 在构造入口拒绝空 block 配置，避免 `Vec[0]` 和 `.last().unwrap()` panic。</p>
           </article>
           <article class="bug-card">
             <h3>BUG-024/031</h3>
