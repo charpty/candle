@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百二十八个 public API 边界修复
+# Candle bug hunt 报告：一百三十二个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百二十八个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百三十二个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -17,7 +17,8 @@ BUG-087 到 BUG-092 覆盖 PaddleOCR-VL vision 构造期配置；BUG-093 到 BUG
 PaddleOCR-VL text attention 配置和空序列 forward 合同；BUG-098 到 BUG-107 覆盖 PaddleOCR-VL
 vision runtime `grid_thw` 合同；BUG-108 到 BUG-116 覆盖 PaddleOCR-VL text M-RoPE 运行期输入合同；
 BUG-117 到 BUG-124 覆盖 PaddleOCR-VL video M-RoPE 运行期输入合同；BUG-125 到 BUG-128 覆盖
-PaddleOCR-VL glue 层多模态输入配对和列表长度合同。
+PaddleOCR-VL glue 层多模态输入配对和列表长度合同；BUG-129 到 BUG-132 覆盖 Qwen3-VL
+多模态元数据和 placeholder span 半配对合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -156,6 +157,10 @@ PaddleOCR-VL glue 层多模态输入配对和列表长度合同。
 | BUG-126 | [candle-transformers/src/models/paddleocr_vl/mod.rs](../candle-transformers/src/models/paddleocr_vl/mod.rs) | `forward` 收到 `grid_thw` 但缺少 `pixel_values` 时静默忽略视觉元数据 | 同样拒绝半配对多模态输入 |
 | BUG-127 | [candle-transformers/src/models/paddleocr_vl/mod.rs](../candle-transformers/src/models/paddleocr_vl/mod.rs) | `encode_images_separate` 的 `zip` 会吞掉缺 grid 的多余图像 | 校验 image 列表和 grid 列表长度一致 |
 | BUG-128 | [candle-transformers/src/models/paddleocr_vl/mod.rs](../candle-transformers/src/models/paddleocr_vl/mod.rs) | `encode_images_separate` 的 `zip` 会吞掉缺 image 的多余 grid | 同样拒绝多余 grid 元数据 |
+| BUG-129 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `image_grid_thw` 存在但 `pixel_values` 缺席时被静默忽略 | image grid 和 image pixels 必须成对提供 |
+| BUG-130 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `video_grid_thw` 存在但 `pixel_values_videos` 缺席时被静默忽略 | video grid 和 video pixels 必须成对提供 |
+| BUG-131 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `continuous_img_pad` 非空但没有 image pixels 时仍走纯文本路径 | 没有 image pixels 时拒绝 image placeholder span |
+| BUG-132 | [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs) | `continuous_vid_pad` 非空但没有 video pixels 时仍走纯文本路径 | 没有 video pixels 时拒绝 video placeholder span |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2348,7 +2353,63 @@ git diff --check
 - `agent/bug-127-paddleocr-vl-separate-images-missing-grid`
 - `agent/bug-128-paddleocr-vl-separate-images-extra-grid`
 
-## 一百二十八个案例教什么
+## BUG-129 到 BUG-132：Qwen3-VL 多模态元数据半配对
+
+受影响文件：
+
+- [candle-transformers/src/models/qwen3_vl/mod.rs](../candle-transformers/src/models/qwen3_vl/mod.rs)
+
+这一组回到 Qwen3-VL 的外层 `forward`。它已经校验了“有 `pixel_values` 必须有
+`image_grid_thw`”和“有 `pixel_values_videos` 必须有 `video_grid_thw`”，但没有校验反方向。
+因此调用方只传 grid 元数据、或只传 placeholder span 元数据时，模型会绕过视觉分支，直接把输入当
+纯文本跑完。
+
+这里要区分两类元数据：
+
+- `image_grid_thw` / `video_grid_thw` 描述视觉 encoder 应该如何解释 patch token。
+- `continuous_img_pad` / `continuous_vid_pad` 描述 text 序列中哪些位置应该被视觉 embedding 替换。
+
+它们都不是“可有可无的提示”。如果没有对应 pixel tensor，这些元数据就没有可执行语义。继续跑纯文本
+会让 image/video 特殊 token 走普通 embedding，调用方还以为视觉信息已经参与推理。
+
+修复前 4 个测试的失败形态：
+
+- `image_grid_thw = Some(...)`、`pixel_values = None` 返回 `Ok`。
+- `video_grid_thw = Some(...)`、`pixel_values_videos = None` 返回 `Ok`。
+- `continuous_img_pad = [[(1, 2)]]`、`pixel_values = None` 返回 `Ok`。
+- `continuous_vid_pad = [[(1, 2)]]`、`pixel_values_videos = None` 返回 `Ok`。
+
+修复策略：
+
+1. 在 `forward` 入口对 image 和 video 两套 `Option` 做双向配对校验。
+2. 如果没有 image pixels，则 `continuous_img_pad` 必须全空。
+3. 如果没有 video pixels，则 `continuous_vid_pad` 必须全空。
+4. 测试使用零权重 tiny model，并把 `temporal_patch_size` 设为 2，因为本地 `conv3d_temporal_2`
+   helper 明确按 temporal patch size 2 拆权重。
+
+新增测试：
+
+- `forward_rejects_image_grid_without_pixel_values`
+- `forward_rejects_video_grid_without_pixel_values`
+- `forward_rejects_image_spans_without_pixel_values`
+- `forward_rejects_video_spans_without_pixel_values`
+
+修复后验证：
+
+```bash
+cargo test -p candle-transformers models::qwen3_vl::tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-129-qwen3-vl-image-grid-without-pixels`
+- `agent/bug-130-qwen3-vl-video-grid-without-pixels`
+- `agent/bug-131-qwen3-vl-image-spans-without-pixels`
+- `agent/bug-132-qwen3-vl-video-spans-without-pixels`
+
+## 一百三十二个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
