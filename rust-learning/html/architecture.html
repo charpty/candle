@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：137 个 public API 边界</h2>
+          <h2>真实修复：138 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -223,6 +223,10 @@
           <article class="bug-card">
             <h3>BUG-003</h3>
             <p>`pixel_shuffle` / `pixel_unshuffle` 接收 0 factor 时会除零 panic；修复后返回明确错误，并补 round-trip 测试。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-138</h3>
+            <p>`Tensor::chunk(0, dim)` 在 core 层拒绝零 chunks，避免 `size / chunks` 除零 panic。</p>
           </article>
           <article class="bug-card">
             <h3>BUG-004</h3>

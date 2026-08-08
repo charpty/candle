@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百三十七个 public API 边界修复
+# Candle bug hunt 报告：一百三十八个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百三十七个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百三十八个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -20,7 +20,7 @@ BUG-117 到 BUG-124 覆盖 PaddleOCR-VL video M-RoPE 运行期输入合同；BUG
 PaddleOCR-VL glue 层多模态输入配对和列表长度合同；BUG-129 到 BUG-132 覆盖 Qwen3-VL
 多模态元数据和 placeholder span 半配对合同；BUG-133 到 BUG-134 覆盖 Stable Diffusion
 UNet/VAE 构造期空 block 配置；BUG-135 到 BUG-137 覆盖 Stable Diffusion VAE latent
-distribution 参数通道合同。
+distribution 参数通道合同；BUG-138 覆盖 core `Tensor::chunk` 的零 chunks 参数。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -168,6 +168,7 @@ distribution 参数通道合同。
 | BUG-135 | [candle-transformers/src/models/stable_diffusion/vae.rs](../candle-transformers/src/models/stable_diffusion/vae.rs) | VAE `DiagonalGaussianDistribution::new` 对 0 个参数通道 unwrap panic | 要求参数通道数为非零偶数 |
 | BUG-136 | [candle-transformers/src/models/stable_diffusion/vae.rs](../candle-transformers/src/models/stable_diffusion/vae.rs) | VAE distribution 只有 1 个参数通道时第二个 chunk 缺失并 panic | 同一入口拒绝单通道参数 |
 | BUG-137 | [candle-transformers/src/models/stable_diffusion/vae.rs](../candle-transformers/src/models/stable_diffusion/vae.rs) | 奇数参数通道被拆成不等长 mean/logvar 后仍返回 Ok | 拒绝奇数通道，保证 mean/logvar 等长 |
+| BUG-138 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::chunk(0, dim)` 在 `size / chunks` 处除零 panic | 入口拒绝零 chunks |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2514,7 +2515,50 @@ git diff --check
 - `agent/bug-136-stable-diffusion-vae-single-gaussian-channel`
 - `agent/bug-137-stable-diffusion-vae-odd-gaussian-channels`
 
-## 一百三十七个案例教什么
+## BUG-138：`Tensor::chunk` 的零 chunks 参数
+
+受影响文件：
+
+- [candle-core/src/tensor.rs](../candle-core/src/tensor.rs)
+- [candle-core/tests/tensor_tests.rs](../candle-core/tests/tensor_tests.rs)
+
+`Tensor::chunk(chunks, dim)` 是 core 层 public API，签名返回 `Result<Vec<Tensor>>`。旧实现会先读取目标
+维度大小，然后在 `size >= chunks` 分支里计算：
+
+```rust
+let chunk_size = size / chunks;
+```
+
+当调用方传 `chunks = 0` 时，这里直接除零 panic。这个案例和 `groups = 0`、`num_heads = 0`、
+`pixel_shuffle factor = 0` 是同一类：参数参与除法前，必须先把 0 排除掉。
+
+修复前测试失败形态：
+
+- `Tensor::zeros((2, 3), ...)?.chunk(0, 0)` 在 `size / chunks` 处 panic。
+
+修复策略：
+
+1. 在 `Tensor::chunk` 入口检查 `chunks == 0`。
+2. 通过 `candle::bail!` 返回明确错误。
+3. 保持 `size < chunks` 时“可能返回少于请求数量 chunk”的原有语义不变。
+
+新增测试：
+
+- `chunk_rejects_zero_chunks`
+
+修复后验证：
+
+```bash
+cargo test -p candle-core --test tensor_tests chunk_rejects_zero_chunks
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-138-tensor-chunk-zero-chunks`
+
+## 一百三十八个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
