@@ -141,6 +141,14 @@ impl PaddleOCRVLModel {
         pixel_values_list: &[Tensor],
         grid_thw_list: &[Tensor],
     ) -> Result<Vec<Tensor>> {
+        if pixel_values_list.len() != grid_thw_list.len() {
+            candle::bail!(
+                "pixel_values_list length ({}) must match grid_thw_list length ({})",
+                pixel_values_list.len(),
+                grid_thw_list.len()
+            );
+        }
+
         let mut embeddings = Vec::with_capacity(pixel_values_list.len());
 
         for (pixel_values, grid_thw) in pixel_values_list.iter().zip(grid_thw_list.iter()) {
@@ -169,6 +177,15 @@ impl PaddleOCRVLModel {
         seqlen_offset: usize,
     ) -> Result<Tensor> {
         let (batch_size, seq_len) = input_ids.dims2()?;
+        match (pixel_values.is_some(), grid_thw.is_some()) {
+            (true, false) => {
+                candle::bail!("grid_thw must be provided when pixel_values is provided")
+            }
+            (false, true) => {
+                candle::bail!("pixel_values must be provided when grid_thw is provided")
+            }
+            _ => {}
+        }
 
         // Get text embeddings
         let mut input_embeds = self.text.embed_tokens(input_ids)?;
@@ -1100,5 +1117,126 @@ impl PaddleOCRVLModel {
         }
 
         Ok((generated_tokens, all_tensors))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::Activation;
+
+    use crate::models::paddleocr_vl::config::RopeScaling;
+
+    fn tiny_config() -> Config {
+        Config {
+            vision_config: VisionConfig {
+                hidden_size: 8,
+                intermediate_size: 16,
+                num_hidden_layers: 0,
+                num_attention_heads: 2,
+                num_channels: 3,
+                image_size: 2,
+                patch_size: 1,
+                hidden_act: Activation::GeluPytorchTanh,
+                layer_norm_eps: 1e-6,
+                attention_dropout: 0.0,
+                spatial_merge_size: 1,
+            },
+            vocab_size: 128,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 0,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            hidden_act: Activation::Silu,
+            max_position_embeddings: 16,
+            layer_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            head_dim: 4,
+            use_bias: false,
+            tie_word_embeddings: true,
+            image_token_id: 99,
+            video_token_id: 98,
+            vision_start_token_id: 97,
+            vision_end_token_id: 96,
+            rope_scaling: Some(RopeScaling {
+                mrope_section: vec![1, 1, 0],
+                rope_type: Some("default".to_string()),
+            }),
+            tokens_per_second: 2,
+        }
+    }
+
+    fn new_model() -> Result<PaddleOCRVLModel> {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        PaddleOCRVLModel::new(&tiny_config(), vb)
+    }
+
+    fn pixel_values() -> Result<Tensor> {
+        Tensor::zeros((1, 3, 2, 2), DType::F32, &Device::Cpu)
+    }
+
+    fn grid_thw() -> Result<Tensor> {
+        Tensor::new(&[[1u32, 2, 2]], &Device::Cpu)
+    }
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn forward_rejects_pixel_values_without_grid() -> Result<()> {
+        let mut model = new_model()?;
+        let input_ids = Tensor::new(&[[1u32, 99, 2, 3]], &Device::Cpu)?;
+        let pixel_values = pixel_values()?;
+        assert_err_contains(
+            model.forward(&input_ids, Some(&pixel_values), None, 0),
+            "grid_thw",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forward_rejects_grid_without_pixel_values() -> Result<()> {
+        let mut model = new_model()?;
+        let input_ids = Tensor::new(&[[1u32, 99, 2, 3]], &Device::Cpu)?;
+        let grid_thw = grid_thw()?;
+        assert_err_contains(
+            model.forward(&input_ids, None, Some(&grid_thw), 0),
+            "pixel_values",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn encode_images_separate_rejects_missing_grid() -> Result<()> {
+        let model = new_model()?;
+        let pixel_values = pixel_values()?;
+        assert_err_contains(
+            model.encode_images_separate(&[pixel_values], &[]),
+            "grid_thw_list",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn encode_images_separate_rejects_extra_grid() -> Result<()> {
+        let model = new_model()?;
+        let grid_thw = grid_thw()?;
+        assert_err_contains(
+            model.encode_images_separate(&[], &[grid_thw]),
+            "pixel_values_list",
+        );
+        Ok(())
     }
 }
