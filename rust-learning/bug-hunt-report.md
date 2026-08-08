@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百二十四个 public API 边界修复
+# Candle bug hunt 报告：一百二十八个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百二十四个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百二十八个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -15,8 +15,9 @@ forward 边界；BUG-075 到 BUG-080 覆盖 Qwen3-VL 外层 forward 的 per-batc
 placeholder span 合同；BUG-081 到 BUG-086 覆盖 Qwen3-VL vision runtime `grid_thw` 合同；
 BUG-087 到 BUG-092 覆盖 PaddleOCR-VL vision 构造期配置；BUG-093 到 BUG-097 覆盖
 PaddleOCR-VL text attention 配置和空序列 forward 合同；BUG-098 到 BUG-107 覆盖 PaddleOCR-VL
-vision runtime `grid_thw` 合同；BUG-108 到 BUG-116 覆盖 PaddleOCR-VL text M-RoPE 运行期输入合同。
-BUG-117 到 BUG-124 覆盖 PaddleOCR-VL video M-RoPE 运行期输入合同。
+vision runtime `grid_thw` 合同；BUG-108 到 BUG-116 覆盖 PaddleOCR-VL text M-RoPE 运行期输入合同；
+BUG-117 到 BUG-124 覆盖 PaddleOCR-VL video M-RoPE 运行期输入合同；BUG-125 到 BUG-128 覆盖
+PaddleOCR-VL glue 层多模态输入配对和列表长度合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -151,6 +152,10 @@ BUG-117 到 BUG-124 覆盖 PaddleOCR-VL video M-RoPE 运行期输入合同。
 | BUG-122 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | negative `second_per_grid_t` 会生成负 temporal position | 要求 second_per_grid_t 为正数 |
 | BUG-123 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | non-finite `second_per_grid_t` 被 cast 成整数位置 | 要求 second_per_grid_t 有限 |
 | BUG-124 | [candle-transformers/src/models/paddleocr_vl/text.rs](../candle-transformers/src/models/paddleocr_vl/text.rs) | 额外非连续 video token 被当成文本 token | 统计全序列 video token，要求数量和 span 连续 |
+| BUG-125 | [candle-transformers/src/models/paddleocr_vl/mod.rs](../candle-transformers/src/models/paddleocr_vl/mod.rs) | `forward` 收到 `pixel_values` 但缺少 `grid_thw` 时静默走文本路径 | `pixel_values` 和 `grid_thw` 必须成对提供 |
+| BUG-126 | [candle-transformers/src/models/paddleocr_vl/mod.rs](../candle-transformers/src/models/paddleocr_vl/mod.rs) | `forward` 收到 `grid_thw` 但缺少 `pixel_values` 时静默忽略视觉元数据 | 同样拒绝半配对多模态输入 |
+| BUG-127 | [candle-transformers/src/models/paddleocr_vl/mod.rs](../candle-transformers/src/models/paddleocr_vl/mod.rs) | `encode_images_separate` 的 `zip` 会吞掉缺 grid 的多余图像 | 校验 image 列表和 grid 列表长度一致 |
+| BUG-128 | [candle-transformers/src/models/paddleocr_vl/mod.rs](../candle-transformers/src/models/paddleocr_vl/mod.rs) | `encode_images_separate` 的 `zip` 会吞掉缺 image 的多余 grid | 同样拒绝多余 grid 元数据 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2293,7 +2298,57 @@ git diff --check
 - `agent/bug-123-paddleocr-vl-video-nonfinite-seconds-per-grid-t`
 - `agent/bug-124-paddleocr-vl-video-extra-token-span`
 
-## 一百二十四个案例教什么
+## BUG-125 到 BUG-128：PaddleOCR-VL glue 层多模态输入合同
+
+受影响文件：
+
+- [candle-transformers/src/models/paddleocr_vl/mod.rs](../candle-transformers/src/models/paddleocr_vl/mod.rs)
+
+这一组不在 attention 或 RoPE 算法内部，而在模型 glue 层。glue 层负责把 text token、image
+tensor、`grid_thw` 这几类跨模块输入对齐后交给 vision encoder 和 text decoder。这里的 bug
+更隐蔽，因为代码不会 panic，反而会“看起来正常”地走完文本路径或跳过一部分输入。
+
+修复前 4 个测试的失败形态：
+
+- `forward(input_ids, Some(pixel_values), None, ...)` 返回 `Ok`，视觉输入被静默忽略。
+- `forward(input_ids, None, Some(grid_thw), ...)` 返回 `Ok`，视觉 grid 元数据被静默忽略。
+- `encode_images_separate(&[image], &[])` 返回空结果；`zip` 按较短列表停止，多余 image 没有报错。
+- `encode_images_separate(&[], &[grid])` 同样返回空结果；多余 grid 没有报错。
+
+Rust 这里有一个值得反复记住的点：`Iterator::zip` 的语义是按短的一侧截断。它适合处理已经验证过
+长度一致的并行数组，不适合自己承担“长度必须一致”的业务合同。模型 glue 层如果直接把 `zip`
+当校验，就会把少传或多传的多模态输入变成静默截断。
+
+修复策略：
+
+1. 在 `forward` 入口用 `match (pixel_values.is_some(), grid_thw.is_some())` 校验二者必须同时存在或同时缺席。
+2. 在 `encode_images_separate` 入口要求 `pixel_values_list.len() == grid_thw_list.len()`。
+3. 保持纯文本推理路径不变：二者都为 `None` 时仍按文本模型运行。
+4. 用零权重 tiny model 做 UT，避免下载 checkpoint，同时让测试只验证 API 合同。
+
+新增测试：
+
+- `forward_rejects_pixel_values_without_grid`
+- `forward_rejects_grid_without_pixel_values`
+- `encode_images_separate_rejects_missing_grid`
+- `encode_images_separate_rejects_extra_grid`
+
+修复后验证：
+
+```bash
+cargo test -p candle-transformers models::paddleocr_vl::tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-125-paddleocr-vl-forward-pixel-without-grid`
+- `agent/bug-126-paddleocr-vl-forward-grid-without-pixel`
+- `agent/bug-127-paddleocr-vl-separate-images-missing-grid`
+- `agent/bug-128-paddleocr-vl-separate-images-extra-grid`
+
+## 一百二十八个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
@@ -2305,6 +2360,8 @@ git diff --check
 - 模型加载代码里不应该用 `unwrap()` 处理 checkpoint 错误。
 - 有状态组件的 fallible append 必须考虑失败原子性，不能让 `?` 之前已经污染 `self`。
 - Batch 级输入必须显式校验长度；“短了静默错形状，长了越界 panic”比单纯报错更危险。
+- `Option` 成对参数要把四种组合全部想清楚，不能让半配对多模态输入静默降级。
+- `zip` 会按短列表截断；在 public API 边界先校验长度，再用它做并行遍历。
 - 构造函数内部的配置派生值要先验合法性，再计算除法、取模、reshape 或 position embedding 长度。
 - 模型加载函数中同一个 `unwrap()` 模式会在不同模型里重复出现；每个 public loader 都要独立测试。
 - 分组卷积这类看似底层的配置字段，必须先校验再参与 shape 计算。

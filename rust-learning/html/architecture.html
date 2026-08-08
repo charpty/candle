@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：124 个 public API 边界</h2>
+          <h2>真实修复：128 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -327,6 +327,10 @@
           <article class="bug-card">
             <h3>BUG-117/124</h3>
             <p>PaddleOCR-VL video M-RoPE 校验 video grid、时间缩放参数和 video token span。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-125/128</h3>
+            <p>PaddleOCR-VL glue 层要求 `pixel_values` 和 `grid_thw` 成对出现，并拒绝 image/grid 列表被 `zip` 静默截断。</p>
           </article>
           <article class="bug-card">
             <h3>审计方法</h3>

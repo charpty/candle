@@ -313,7 +313,7 @@ cargo run -p candle-examples --example rust-candle-tour -- --cpu
 
 ## 10. 真实 bug 案例
 
-这次 bug hunt 累计修了 124 个 public API 边界问题，覆盖 Candle 的二十五条典型边界：
+这次 bug hunt 累计修了 128 个 public API 边界问题，覆盖 Candle 的二十六条典型边界：
 
 | bug | 所在层 | 教学价值 |
 | --- | --- | --- |
@@ -342,6 +342,7 @@ cargo run -p candle-examples --example rust-candle-tour -- --cpu
 | PaddleOCR-VL vision grid 输入 | `candle-transformers` 多模态模型 | runtime `grid_thw` 也必须精确校验列数、空值、t/h/w、merge 整除、token 数和面积计算。 |
 | PaddleOCR-VL text M-RoPE 输入 | `candle-transformers` 多模态模型 | `position_ids` 和 image token/grid 数量是 M-RoPE 的运行期协议，不能靠 broadcast 或默认文本位置兜底。 |
 | PaddleOCR-VL video M-RoPE 输入 | `candle-transformers` 多模态模型 | video grid、时间缩放参数和 video token span 必须在 position id helper 入口闭合。 |
+| PaddleOCR-VL multimodal glue 输入 | `candle-transformers` glue 层 | `pixel_values` 和 `grid_thw` 必须成对提供，image/grid 列表必须等长；`zip` 只能遍历已校验的并行输入。 |
 
 ### 10.1 `replication_pad2d`
 
@@ -438,7 +439,7 @@ decode step。修复时不能只让当前调用返回 `Err`，还要断言失败
 这批案例的判断口径更严格：不是“配置不推荐”，而是构造函数内部会直接除零、静默截断必要维度，
 或在返回 `Result<Self>` 的加载函数里 panic。详细复现和修复见 [bug-hunt-report.md](./bug-hunt-report.md)。
 
-这 124 个 bug 值得放进学习资料，因为它们展示了 Rust/Candle 源码审计的正确顺序：
+这 128 个 bug 值得放进学习资料，因为它们展示了 Rust/Candle 源码审计的正确顺序：
 
 1. 先看 public API 签名。返回 `Result` 的函数不应该轻易 panic。
 2. 再看 shape 合同。4D Tensor 不等于空间维度一定非空。
