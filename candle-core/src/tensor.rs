@@ -826,6 +826,9 @@ impl Tensor {
     /// Split a tensor into the specified number of chunks, this may return less chunks than
     /// specified.
     pub fn chunk<D: Dim>(&self, chunks: usize, dim: D) -> Result<Vec<Self>> {
+        if chunks == 0 {
+            crate::bail!("chunk expects a non-zero number of chunks");
+        }
         let dim = dim.to_index(self.shape(), "chunk")?;
         let size = self.dim(dim)?;
         if size < chunks {

@@ -2100,6 +2100,19 @@ fn tensor_norm() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn chunk_rejects_zero_chunks() -> Result<()> {
+    let t = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
+    match t.chunk(0, 0) {
+        Ok(_) => panic!("expected chunk(0, _) to return an error"),
+        Err(err) => assert!(
+            err.to_string().contains("chunk"),
+            "expected chunk error, got {err:?}"
+        ),
+    }
+    Ok(())
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn transfers_cuda_to_device() -> Result<()> {
