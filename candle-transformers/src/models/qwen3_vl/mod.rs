@@ -67,6 +67,24 @@ impl Qwen3VLModel {
         seqlen_offsets: &[usize],
     ) -> Result<Tensor> {
         let (bs, seqlen) = input_ids.dims2()?;
+        match (pixel_values.is_some(), image_grid_thw.is_some()) {
+            (true, false) => candle::bail!("pixel_values require image_grid_thw"),
+            (false, true) => candle::bail!("image_grid_thw requires pixel_values"),
+            _ => {}
+        }
+        match (pixel_values_videos.is_some(), video_grid_thw.is_some()) {
+            (true, false) => candle::bail!("pixel_values_videos require video_grid_thw"),
+            (false, true) => candle::bail!("video_grid_thw requires pixel_values_videos"),
+            _ => {}
+        }
+        if pixel_values.is_none() && continuous_img_pad.iter().any(|spans| !spans.is_empty()) {
+            candle::bail!("continuous_img_pad requires pixel_values");
+        }
+        if pixel_values_videos.is_none() && continuous_vid_pad.iter().any(|spans| !spans.is_empty())
+        {
+            candle::bail!("continuous_vid_pad requires pixel_values_videos");
+        }
+
         let attention_mask = if seqlen <= 1 {
             Some(self.prepare_decoder_attention_mask(
                 bs,
@@ -266,5 +284,158 @@ impl Qwen3VLModel {
             deepstack_visual_embeds.as_deref(),
         )?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_nn::{Activation, VarBuilder};
+
+    use crate::models::qwen3_vl::config::{TextConfig, VisionConfig};
+
+    fn tiny_config() -> Config {
+        Config {
+            text_config: TextConfig {
+                head_dim: 4,
+                vocab_size: 128,
+                hidden_size: 8,
+                intermediate_size: 16,
+                num_hidden_layers: 0,
+                num_attention_heads: 2,
+                num_key_value_heads: 1,
+                hidden_act: Activation::Silu,
+                max_position_embeddings: 16,
+                rms_norm_eps: 1e-6,
+                tie_word_embeddings: true,
+                rope_theta: 10000.0,
+                sliding_window: None,
+            },
+            vision_config: VisionConfig {
+                depth: 0,
+                hidden_size: 8,
+                out_hidden_size: 8,
+                hidden_act: Activation::Gelu,
+                intermediate_size: 16,
+                num_heads: 2,
+                in_chans: 3,
+                patch_size: 1,
+                spatial_merge_size: 1,
+                temporal_patch_size: 2,
+                num_position_embeddings: 4,
+                deepstack_visual_indexes: Vec::new(),
+            },
+            image_token_id: 99,
+            video_token_id: 98,
+            vision_start_token_id: 97,
+            vision_end_token_id: 96,
+        }
+    }
+
+    fn new_model() -> Result<Qwen3VLModel> {
+        let device = Device::Cpu;
+        let vb = VarBuilder::zeros(DType::F32, &device);
+        Qwen3VLModel::new(&tiny_config(), vb)
+    }
+
+    fn input_ids() -> Result<Tensor> {
+        Tensor::new(&[[1u32, 2]], &Device::Cpu)
+    }
+
+    fn grid_thw() -> Result<Tensor> {
+        Tensor::new(&[[1u32, 2, 2]], &Device::Cpu)
+    }
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn forward_rejects_image_grid_without_pixel_values() -> Result<()> {
+        let model = new_model()?;
+        assert_err_contains(
+            model.forward(
+                &input_ids()?,
+                None,
+                None,
+                Some(grid_thw()?),
+                None,
+                vec![2],
+                vec![vec![]],
+                vec![vec![]],
+                &[0],
+            ),
+            "image_grid_thw",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forward_rejects_video_grid_without_pixel_values() -> Result<()> {
+        let model = new_model()?;
+        assert_err_contains(
+            model.forward(
+                &input_ids()?,
+                None,
+                None,
+                None,
+                Some(grid_thw()?),
+                vec![2],
+                vec![vec![]],
+                vec![vec![]],
+                &[0],
+            ),
+            "video_grid_thw",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forward_rejects_image_spans_without_pixel_values() -> Result<()> {
+        let model = new_model()?;
+        assert_err_contains(
+            model.forward(
+                &Tensor::new(&[[1u32, 99]], &Device::Cpu)?,
+                None,
+                None,
+                None,
+                None,
+                vec![2],
+                vec![vec![(1, 2)]],
+                vec![vec![]],
+                &[0],
+            ),
+            "continuous_img_pad",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forward_rejects_video_spans_without_pixel_values() -> Result<()> {
+        let model = new_model()?;
+        assert_err_contains(
+            model.forward(
+                &Tensor::new(&[[1u32, 98]], &Device::Cpu)?,
+                None,
+                None,
+                None,
+                None,
+                vec![2],
+                vec![vec![]],
+                vec![vec![(1, 2)]],
+                &[0],
+            ),
+            "continuous_vid_pad",
+        );
+        Ok(())
     }
 }
