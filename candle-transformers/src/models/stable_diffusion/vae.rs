@@ -299,9 +299,16 @@ pub struct DiagonalGaussianDistribution {
 
 impl DiagonalGaussianDistribution {
     pub fn new(parameters: &Tensor) -> Result<Self> {
-        let mut parameters = parameters.chunk(2, 1)?.into_iter();
-        let mean = parameters.next().unwrap();
-        let logvar = parameters.next().unwrap();
+        let channels = parameters.dim(1)?;
+        if channels == 0 || channels % 2 != 0 {
+            candle::bail!(
+                "DiagonalGaussianDistribution parameter channels ({channels}) must be a non-zero even number"
+            );
+        }
+
+        let parameters = parameters.chunk(2, 1)?;
+        let mean = parameters[0].clone();
+        let logvar = parameters[1].clone();
         let std = (logvar * 0.5)?.exp()?;
         Ok(DiagonalGaussianDistribution { mean, std })
     }
@@ -309,6 +316,46 @@ impl DiagonalGaussianDistribution {
     pub fn sample(&self) -> Result<Tensor> {
         let sample = self.mean.randn_like(0., 1.);
         &self.mean + &self.std * sample
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::{DType, Device};
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn diagonal_gaussian_rejects_zero_parameter_channels() -> Result<()> {
+        let parameters = Tensor::zeros((1, 0, 2, 2), DType::F32, &Device::Cpu)?;
+        assert_err_contains(DiagonalGaussianDistribution::new(&parameters), "channels");
+        Ok(())
+    }
+
+    #[test]
+    fn diagonal_gaussian_rejects_single_parameter_channel() -> Result<()> {
+        let parameters = Tensor::zeros((1, 1, 2, 2), DType::F32, &Device::Cpu)?;
+        assert_err_contains(DiagonalGaussianDistribution::new(&parameters), "channels");
+        Ok(())
+    }
+
+    #[test]
+    fn diagonal_gaussian_rejects_odd_parameter_channels() -> Result<()> {
+        let parameters = Tensor::zeros((1, 3, 2, 2), DType::F32, &Device::Cpu)?;
+        assert_err_contains(DiagonalGaussianDistribution::new(&parameters), "channels");
+        Ok(())
     }
 }
 
