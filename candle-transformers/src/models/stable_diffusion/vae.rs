@@ -331,6 +331,10 @@ impl AutoEncoderKL {
         out_channels: usize,
         config: AutoEncoderKLConfig,
     ) -> Result<Self> {
+        if config.block_out_channels.is_empty() {
+            candle::bail!("AutoEncoderKLConfig block_out_channels must not be empty");
+        }
+
         let latent_channels = config.latent_channels;
         let encoder_cfg = EncoderConfig {
             block_out_channels: config.block_out_channels.clone(),
@@ -399,5 +403,34 @@ impl AutoEncoderKL {
             Some(post_quant_conv) => &post_quant_conv.forward(xs)?,
         };
         self.decoder.forward(xs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::{DType, Device};
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn new_rejects_empty_block_out_channels() -> Result<()> {
+        let device = Device::Cpu;
+        let vb = nn::VarBuilder::zeros(DType::F32, &device);
+        let mut config = AutoEncoderKLConfig::default();
+        config.block_out_channels.clear();
+        assert_err_contains(AutoEncoderKL::new(vb, 3, 3, config), "block_out_channels");
+        Ok(())
     }
 }

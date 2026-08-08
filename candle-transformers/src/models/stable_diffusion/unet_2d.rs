@@ -74,6 +74,35 @@ impl Default for UNet2DConditionModelConfig {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle::{DType, Device};
+
+    fn assert_err_contains<T>(result: Result<T>, expected: &str) {
+        match result {
+            Ok(_) => panic!("expected error containing {expected:?}"),
+            Err(err) => {
+                let err = err.to_string();
+                assert!(
+                    err.contains(expected),
+                    "expected error containing {expected:?}, got {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn new_rejects_empty_blocks() -> Result<()> {
+        let device = Device::Cpu;
+        let vb = nn::VarBuilder::zeros(DType::F32, &device);
+        let mut config = UNet2DConditionModelConfig::default();
+        config.blocks.clear();
+        assert_err_contains(UNet2DConditionModel::new(vb, 4, 4, false, config), "blocks");
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum UNetDownBlock {
     Basic(DownBlock2D),
@@ -108,6 +137,10 @@ impl UNet2DConditionModel {
         use_flash_attn: bool,
         config: UNet2DConditionModelConfig,
     ) -> Result<Self> {
+        if config.blocks.is_empty() {
+            candle::bail!("UNet2DConditionModelConfig blocks must not be empty");
+        }
+
         let n_blocks = config.blocks.len();
         let b_channels = config.blocks[0].out_channels;
         let bl_channels = config.blocks.last().unwrap().out_channels;
