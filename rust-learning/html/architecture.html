@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：146 个 public API 边界</h2>
+          <h2>真实修复：150 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -239,6 +239,10 @@
           <article class="bug-card">
             <h3>BUG-143/146</h3>
             <p>`avg_pool2d` / `max_pool2d` 在输出 shape 计算前统一拒绝零 kernel 和零 stride。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-147/150</h3>
+            <p>`upsample_bilinear2d_with_scale` 先校验 scale 是有限正数，再确认派生输出尺寸非零。</p>
           </article>
           <article class="bug-card">
             <h3>BUG-004</h3>

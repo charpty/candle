@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百四十六个 public API 边界修复
+# Candle bug hunt 报告：一百五十个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百四十六个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百五十个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -23,7 +23,8 @@ UNet/VAE 构造期空 block 配置；BUG-135 到 BUG-137 覆盖 Stable Diffusion
 distribution 参数通道合同；BUG-138 覆盖 core `Tensor::chunk` 的零 chunks 参数。
 BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断合同；BUG-141 到 BUG-142
 覆盖 core `Tensor::var` 的 unbiased reduction 样本数合同；BUG-143 到 BUG-146 覆盖 core
-2D pooling 的 stride/kernel 参数合同。
+2D pooling 的 stride/kernel 参数合同；BUG-147 到 BUG-150 覆盖 bilinear upsample scale
+到输出尺寸的派生合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -180,6 +181,10 @@ BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断�
 | BUG-144 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `max_pool2d_with_stride(..., stride.1 = 0)` 在输出宽度计算中除零 panic | 同一 helper 拒绝 max pooling 零 stride |
 | BUG-145 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `avg_pool2d_with_stride((0, k), ...)` 返回无窗口面积的假输出 shape | 入口拒绝任一零 kernel 维度 |
 | BUG-146 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `max_pool2d_with_stride((k, 0), ...)` 返回无窗口面积的假输出 shape | 同一 helper 拒绝 max pooling 零 kernel 维度 |
+| BUG-147 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `upsample_bilinear2d_with_scale(0.0, ...)` 返回零高 Tensor | scale factor 必须是有限正数 |
+| BUG-148 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | 负数 bilinear scale 被 cast 成 0 输出维度 | 同一校验拒绝负 scale |
+| BUG-149 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | NaN bilinear scale 被 cast 成 0 输出维度 | 同一校验拒绝非有限 scale |
+| BUG-150 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | 很小的正 scale 经 `floor` 后派生出 0 输出尺寸 | scale 合法后还要校验输出尺寸非零 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2764,7 +2769,68 @@ git diff --check
 - `agent/bug-145-avg-pool2d-zero-kernel`
 - `agent/bug-146-max-pool2d-zero-kernel`
 
-## 一百四十六个案例教什么
+## BUG-147 到 BUG-150：bilinear upsample scale 到输出尺寸的派生合同
+
+受影响文件：
+
+- [candle-core/src/tensor.rs](../candle-core/src/tensor.rs)
+- [candle-core/tests/bilinear_tests.rs](../candle-core/tests/bilinear_tests.rs)
+
+`upsample_bilinear2d_with_scale(scale_h, scale_w, align_corners)` 用浮点 scale 派生输出尺寸：
+
+```rust
+let height_out = (height_in as f64 * scale_h).floor() as usize;
+let width_out = (width_in as f64 * scale_w).floor() as usize;
+```
+
+这段代码的问题不在 bilinear 算法本身，而在 `f64` 参数进入 shape 世界之前没有校验。Rust 里浮点转
+`usize` 是一种 lossy cast：`NaN`、负数、小正数 floor 后都可能变成 0。旧实现会把这些非法 scale
+变成零高或零宽 Tensor：
+
+- `scale_h = 0.0` 返回 `[1, 1, 0, 4]`。
+- `scale_w = -1.0` 返回 `[1, 1, 4, 0]`。
+- `scale_h = NaN` 返回 `[1, 1, 0, 4]`。
+- `scale_h = 0.1` 对 4 像素输入 floor 后输出高度为 0。
+
+这里要区分两层合同：
+
+1. scale factor 本身必须是有限正数。
+2. scale 派生出的 output size 也必须非零。
+
+只检查第一层还不够，因为 `0.1` 是有限正数，但 `floor(4 * 0.1) == 0`，后续 backend 仍然没有
+可以采样的位置。shape API 的经验规则是：所有从浮点参数派生出的 `usize` 都要在 cast 前后各审一遍。
+
+修复策略：
+
+1. 在读取输入 shape 后检查 `scale_h` / `scale_w` 都 `is_finite()` 且 `> 0`。
+2. 计算 `height_out` / `width_out`。
+3. 如果任一输出尺寸为 0，返回明确错误。
+4. 保持正常 scale、fractional scale、identity scale 的既有行为不变。
+
+新增测试：
+
+- `bilinear_rejects_zero_height_scale`
+- `bilinear_rejects_negative_width_scale`
+- `bilinear_rejects_nan_height_scale`
+- `bilinear_rejects_scale_with_zero_output_size`
+
+修复后验证：
+
+```bash
+cargo test -p candle-core --test bilinear_tests bilinear_rejects_ -- --nocapture
+cargo test -p candle-core --test bilinear_tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-147-bilinear-scale-validation`
+- `agent/bug-148-bilinear-negative-scale`
+- `agent/bug-149-bilinear-nan-scale`
+- `agent/bug-150-bilinear-zero-output-scale`
+
+## 一百五十个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
@@ -2775,6 +2841,7 @@ git diff --check
 - Shape 计算尽量用整数公式，不要把离散维度转成 `f32` 再 cast 回 `usize`。
 - 统计类 API 要把数学定义里的样本数条件写成代码合同，例如 unbiased variance 需要 `n >= 2`。
 - Pooling/conv 这类窗口 API 要同时校验 kernel、stride 和输入空间尺寸，不能只检查其中一个。
+- 浮点参数进入 shape 计算前要先检查有限性和取值范围，cast 成 `usize` 后还要检查派生尺寸。
 - Tensor rank 正确不代表每个维度都非空。
 - 文档注释引用外部 API 时，行为应该尽量匹配读者预期。
 - 模型加载代码里不应该用 `unwrap()` 处理 checkpoint 错误。

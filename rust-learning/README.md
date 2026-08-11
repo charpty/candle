@@ -26,11 +26,11 @@
   [一次生成全链路拆解](./html/trace-walkthrough.html) 可作为对外交付页。
 - [Candle 项目级架构讲义](./candle-project-architecture.md)：从 workspace、crate 边界、Tensor
   内部结构、后端分发、模型加载到一次 token 生成，讲清整个项目的主干。
-- [Candle bug hunt 报告](./bug-hunt-report.md)：记录 146 个真实边界问题的发现、复现、修复、
+- [Candle bug hunt 报告](./bug-hunt-report.md)：记录 150 个真实边界问题的发现、复现、修复、
   UT 和审计方法，覆盖通用 ops、conv groups、模型加载、KV cache 状态原子性、loss、BatchNorm、
   Mimi transformer、ViT 配置校验，Gemma4 vision/text/audio/multimodal 配置和空输入边界，
   Qwen3-VL/PaddleOCR-VL vision/text 配置、vision grid、空输入、M-RoPE、glue 层调用合同，
-  以及 core Tensor view/reduction/pooling API 的参数验证和错误诊断。
+  以及 core Tensor view/reduction/pooling/upsample API 的参数验证和错误诊断。
 - [本文件](./README.md)：按课程讲 Rust 和 Candle 推理主线，解释完整知识框架。
 - [Rust + Candle 典型用法精讲](./typical-patterns.md)：把本文和 tour 代码里反复出现的
   `Result`、`Option`、借用、Tensor layout、`Module`、`VarBuilder`、KV Cache、Cargo feature、
