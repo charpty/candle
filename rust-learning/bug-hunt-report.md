@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百四十二个 public API 边界修复
+# Candle bug hunt 报告：一百四十六个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百四十二个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百四十六个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -22,7 +22,8 @@ PaddleOCR-VL glue 层多模态输入配对和列表长度合同；BUG-129 到 BU
 UNet/VAE 构造期空 block 配置；BUG-135 到 BUG-137 覆盖 Stable Diffusion VAE latent
 distribution 参数通道合同；BUG-138 覆盖 core `Tensor::chunk` 的零 chunks 参数。
 BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断合同；BUG-141 到 BUG-142
-覆盖 core `Tensor::var` 的 unbiased reduction 样本数合同。
+覆盖 core `Tensor::var` 的 unbiased reduction 样本数合同；BUG-143 到 BUG-146 覆盖 core
+2D pooling 的 stride/kernel 参数合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -175,6 +176,10 @@ BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断�
 | BUG-140 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::unfold` 的 size 越界错误把 op 名写成 `unsqueeze` | 错误信息改为 `unfold`，让调用方能定位真实 API |
 | BUG-141 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::var_keepdim` 在空 reduction 维上计算 `dim_len - 1` 下溢 panic | unbiased variance 入口要求 reduction 长度至少为 2 |
 | BUG-142 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::var` 在单元素 reduction 维上除以 0 并返回 NaN | 同一校验拒绝单元素样本，避免非有限结果 |
+| BUG-143 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `avg_pool2d_with_stride(..., stride.0 = 0)` 在输出高度计算中除零 panic | 入口拒绝任一零 stride |
+| BUG-144 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `max_pool2d_with_stride(..., stride.1 = 0)` 在输出宽度计算中除零 panic | 同一 helper 拒绝 max pooling 零 stride |
+| BUG-145 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `avg_pool2d_with_stride((0, k), ...)` 返回无窗口面积的假输出 shape | 入口拒绝任一零 kernel 维度 |
+| BUG-146 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `max_pool2d_with_stride((k, 0), ...)` 返回无窗口面积的假输出 shape | 同一 helper 拒绝 max pooling 零 kernel 维度 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2697,7 +2702,69 @@ git diff --check
 - `agent/bug-141-tensor-var-reduction-length`
 - `agent/bug-142-tensor-var-singleton-reduction`
 
-## 一百四十二个案例教什么
+## BUG-143 到 BUG-146：2D pooling 的零 stride 和零 kernel
+
+受影响文件：
+
+- [candle-core/src/tensor.rs](../candle-core/src/tensor.rs)
+- [candle-core/tests/pool_tests.rs](../candle-core/tests/pool_tests.rs)
+
+`avg_pool2d_with_stride(kernel_size, stride)` 和 `max_pool2d_with_stride(kernel_size, stride)` 都会先从输入
+`[N, C, H, W]` 推导输出 shape：
+
+```rust
+let h_out = (h - kernel_size.0) / stride.0 + 1;
+let w_out = (w - kernel_size.1) / stride.1 + 1;
+```
+
+旧实现只检查了 kernel 是否大于输入空间尺寸，没有检查 kernel 或 stride 本身是否为 0。
+
+这带来四个可复现问题：
+
+- `avg_pool2d_with_stride((2, 2), (0, 1))` 在 `stride.0` 处除零 panic。
+- `max_pool2d_with_stride((2, 2), (1, 0))` 在 `stride.1` 处除零 panic。
+- `avg_pool2d_with_stride((0, 2), (1, 1))` 返回类似 `[1, 1, 5, 3]` 的假输出 shape。
+- `max_pool2d_with_stride((2, 0), (1, 1))` 返回类似 `[1, 1, 3, 5]` 的假输出 shape。
+
+零 kernel 比零 stride 更隐蔽：它不一定马上 panic，但“窗口面积为 0”的 pooling 没有数学语义，输出 shape
+还会被算大一格。这类错误如果进入 CPU/CUDA/Metal backend，不同 backend 可能表现不同；正确做法是在
+Tensor 层统一拒绝。
+
+修复策略：
+
+1. 新增私有 helper `pool2d_output_shape`。
+2. 先拒绝任一 kernel 维度为 0。
+3. 再拒绝任一 stride 维度为 0。
+4. 然后检查 kernel 不能大于输入空间尺寸。
+5. 合同满足后才计算 `(h - kernel) / stride + 1`。
+
+这也是 Rust 工程里很典型的抽象尺度：avg/max pooling 的 backend op 不同，但参数合同和输出 shape
+公式相同，抽成一个小 helper 能减少重复校验，也能保证错误口径一致。
+
+新增测试：
+
+- `avg_pool2d_rejects_zero_stride`
+- `max_pool2d_rejects_zero_stride`
+- `avg_pool2d_rejects_zero_kernel_size`
+- `max_pool2d_rejects_zero_kernel_size`
+
+修复后验证：
+
+```bash
+cargo test -p candle-core --test pool_tests rejects_zero -- --nocapture
+cargo test -p candle-core --test pool_tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-143-pool2d-parameter-validation`
+- `agent/bug-144-max-pool2d-zero-stride`
+- `agent/bug-145-avg-pool2d-zero-kernel`
+- `agent/bug-146-max-pool2d-zero-kernel`
+
+## 一百四十六个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
@@ -2707,6 +2774,7 @@ git diff --check
 - Tensor view API 的 shape/stride 参数必须先验证再构造；一旦 view 返回 `Ok`，后续算子会信任它。
 - Shape 计算尽量用整数公式，不要把离散维度转成 `f32` 再 cast 回 `usize`。
 - 统计类 API 要把数学定义里的样本数条件写成代码合同，例如 unbiased variance 需要 `n >= 2`。
+- Pooling/conv 这类窗口 API 要同时校验 kernel、stride 和输入空间尺寸，不能只检查其中一个。
 - Tensor rank 正确不代表每个维度都非空。
 - 文档注释引用外部 API 时，行为应该尽量匹配读者预期。
 - 模型加载代码里不应该用 `unwrap()` 处理 checkpoint 错误。
