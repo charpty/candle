@@ -2859,11 +2859,17 @@ impl Tensor {
             let start_included = match range.start_bound() {
                 std::ops::Bound::Unbounded => 0,
                 std::ops::Bound::Included(v) => *v,
-                std::ops::Bound::Excluded(v) => *v + 1,
+                std::ops::Bound::Excluded(v) => match v.checked_add(1) {
+                    Some(v) => v,
+                    None => bail!("slice-assign: start bound overflows for dim {i}"),
+                },
             };
             let end_excluded = match range.end_bound() {
                 std::ops::Bound::Unbounded => self_dims[i],
-                std::ops::Bound::Included(v) => *v + 1,
+                std::ops::Bound::Included(v) => match v.checked_add(1) {
+                    Some(v) => v,
+                    None => bail!("slice-assign: end bound overflows for dim {i}"),
+                },
                 std::ops::Bound::Excluded(v) => *v,
             };
             if end_excluded <= start_included {

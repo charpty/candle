@@ -1,5 +1,6 @@
 use anyhow::Result;
-use candle_core::{Device, IndexOp, Tensor};
+use candle_core::{DType, Device, IndexOp, Tensor};
+use std::ops::Bound;
 
 #[test]
 fn integer_index() -> Result<()> {
@@ -118,5 +119,27 @@ fn slice_assign() -> Result<()> {
             [15, 16, 17, 18, 19]
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn slice_assign_rejects_inclusive_end_overflow() -> Result<()> {
+    let dev = Device::Cpu;
+    let tensor = Tensor::zeros((4, 5), DType::U32, &dev)?;
+    let src = Tensor::zeros((1, 1), DType::U32, &dev)?;
+    assert!(tensor.slice_assign(&[0..=0, 0..=usize::MAX], &src).is_err());
+    Ok(())
+}
+
+#[test]
+fn slice_assign_rejects_excluded_start_overflow() -> Result<()> {
+    let dev = Device::Cpu;
+    let tensor = Tensor::zeros((4, 5), DType::U32, &dev)?;
+    let src = Tensor::zeros((1, 1), DType::U32, &dev)?;
+    let ranges = [
+        (Bound::Included(0), Bound::Excluded(1)),
+        (Bound::Excluded(usize::MAX), Bound::Unbounded),
+    ];
+    assert!(tensor.slice_assign(&ranges, &src).is_err());
     Ok(())
 }
