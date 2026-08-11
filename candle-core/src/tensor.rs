@@ -1331,6 +1331,27 @@ impl Tensor {
         ))
     }
 
+    fn pool2d_output_shape(
+        op: &'static str,
+        h: usize,
+        w: usize,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+    ) -> Result<(usize, usize)> {
+        if kernel_size.0 == 0 || kernel_size.1 == 0 {
+            bail!("{op}: kernel-size must be non-zero, got {kernel_size:?}")
+        }
+        if stride.0 == 0 || stride.1 == 0 {
+            bail!("{op}: stride must be non-zero, got {stride:?}")
+        }
+        if h < kernel_size.0 || w < kernel_size.1 {
+            bail!("{op}: kernel-size {kernel_size:?} is larger than the input size {h},{w}")
+        }
+        let h_out = (h - kernel_size.0) / stride.0 + 1;
+        let w_out = (w - kernel_size.1) / stride.1 + 1;
+        Ok((h_out, w_out))
+    }
+
     /// 2D average pooling over an input tensor with multiple channels.
     ///
     /// The input tensor should have four dimensions, `(batch, channels, h, w)`, the returned
@@ -1352,12 +1373,8 @@ impl Tensor {
         let kernel_size = kernel_size.to_usize2();
         let stride = stride.to_usize2();
         let (n, c, h, w) = self.dims4()?;
-        if h < kernel_size.0 || w < kernel_size.1 {
-            bail!("kernel-size {kernel_size:?} is larger than the input size {h},{w}")
-        }
         // https://pytorch.org/docs/stable/generated/torch.nn.AvgPool2d.html#torch.nn.AvgPool2d
-        let h_out = (h - kernel_size.0) / stride.0 + 1;
-        let w_out = (w - kernel_size.1) / stride.1 + 1;
+        let (h_out, w_out) = Self::pool2d_output_shape("avg_pool2d", h, w, kernel_size, stride)?;
         let op = BackpropOp::new1(self, |arg| Op::AvgPool2D {
             arg,
             kernel_size,
@@ -1390,12 +1407,8 @@ impl Tensor {
         let kernel_size = kernel_size.to_usize2();
         let stride = stride.to_usize2();
         let (n, c, h, w) = self.dims4()?;
-        if h < kernel_size.0 || w < kernel_size.1 {
-            bail!("kernel-size {kernel_size:?} is larger than the input size {h},{w}")
-        }
         // https://pytorch.org/docs/stable/generated/torch.nn.MaxPool2d.html#torch.nn.MaxPool2d
-        let h_out = (h - kernel_size.0) / stride.0 + 1;
-        let w_out = (w - kernel_size.1) / stride.1 + 1;
+        let (h_out, w_out) = Self::pool2d_output_shape("max_pool2d", h, w, kernel_size, stride)?;
         let op = BackpropOp::new1(self, |arg| Op::MaxPool2D {
             arg,
             kernel_size,

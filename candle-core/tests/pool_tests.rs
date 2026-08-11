@@ -33,6 +33,58 @@ fn max_pool2d(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn avg_pool2d_rejects_zero_stride() -> Result<()> {
+    let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
+    let err = t
+        .avg_pool2d_with_stride((2, 2), (0, 1))
+        .expect_err("avg_pool2d should reject a zero stride");
+    assert!(
+        err.to_string().contains("stride"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn max_pool2d_rejects_zero_stride() -> Result<()> {
+    let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
+    let err = t
+        .max_pool2d_with_stride((2, 2), (1, 0))
+        .expect_err("max_pool2d should reject a zero stride");
+    assert!(
+        err.to_string().contains("stride"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn avg_pool2d_rejects_zero_kernel_size() -> Result<()> {
+    let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
+    let err = t
+        .avg_pool2d_with_stride((0, 2), (1, 1))
+        .expect_err("avg_pool2d should reject a zero kernel size");
+    assert!(
+        err.to_string().contains("kernel-size"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn max_pool2d_rejects_zero_kernel_size() -> Result<()> {
+    let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
+    let err = t
+        .max_pool2d_with_stride((2, 0), (1, 1))
+        .expect_err("max_pool2d should reject a zero kernel size");
+    assert!(
+        err.to_string().contains("kernel-size"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
 /* This test corresponds to the following PyTorch script.
 import torch
 torch.manual_seed(4242)
