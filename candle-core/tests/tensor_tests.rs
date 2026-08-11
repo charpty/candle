@@ -2100,6 +2100,33 @@ fn tensor_norm() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn unfold_rejects_zero_step() -> Result<()> {
+    let t = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
+    let err = t
+        .unfold(1, 1, 0)
+        .expect_err("unfold should reject a zero step");
+    assert!(
+        err.to_string().contains("step"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn unfold_size_error_mentions_unfold() -> Result<()> {
+    let t = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
+    let err = t
+        .unfold(1, 4, 1)
+        .expect_err("unfold should reject a size larger than the selected dimension");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unfold") && !msg.contains("unsqueeze"),
+        "unexpected error message: {msg}"
+    );
+    Ok(())
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn transfers_cuda_to_device() -> Result<()> {

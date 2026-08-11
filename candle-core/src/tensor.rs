@@ -2943,6 +2943,9 @@ impl Tensor {
         let mut strides = self.stride().to_vec();
 
         let dim = dim.to_index(self.shape(), "unfold")?;
+        if step == 0 {
+            bail!("unfold: step cannot be zero")
+        }
 
         let max_len = if self.dims().is_empty() {
             1
@@ -2951,7 +2954,7 @@ impl Tensor {
         };
         if size > max_len {
             bail!(
-                "unsqueeze: maximum size for tensor at dimension {dim} is {max_len} but size is {size}"
+                "unfold: maximum size for tensor at dimension {dim} is {max_len} but size is {size}"
             )
         }
         sizes.push(size);
@@ -2962,7 +2965,7 @@ impl Tensor {
         });
 
         if !self.dims().is_empty() {
-            sizes[dim] = ((sizes[dim] as f32 - size as f32) / step as f32 + 1.) as usize;
+            sizes[dim] = (sizes[dim] - size) / step + 1;
             strides[dim] *= step;
         }
 
