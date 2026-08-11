@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：160 个 public API 边界</h2>
+          <h2>真实修复：162 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -259,6 +259,10 @@
           <article class="bug-card">
             <h3>BUG-159/160</h3>
             <p>`Tensor::slice_scatter` 用 checked arithmetic 校验 `start + len`，避免超大 start 溢出。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-161/162</h3>
+            <p>`Tensor::slice_assign` 对 included/excluded range bound 的 `+ 1` 转换使用 checked arithmetic。</p>
           </article>
           <article class="bug-card">
             <h3>BUG-004</h3>

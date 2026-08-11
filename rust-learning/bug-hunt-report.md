@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百六十个 public API 边界修复
+# Candle bug hunt 报告：一百六十二个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百六十个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百六十二个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -27,7 +27,8 @@ BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断�
 到输出尺寸的派生合同；BUG-151 到 BUG-155 覆盖 upsample 空输入空间维合同。
 BUG-156 覆盖 core `Tensor::get` 对标量非零索引的参数忽略问题；BUG-157 到 BUG-158
 覆盖 core `Tensor::repeat` 的 repeat 维数和零 factor 合同；BUG-159 到 BUG-160 覆盖
-`Tensor::slice_scatter` 的 start 加法溢出合同。
+`Tensor::slice_scatter` 的 start 加法溢出合同；BUG-161 到 BUG-162 覆盖 `Tensor::slice_assign`
+的 range bound 转换溢出合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -198,6 +199,8 @@ BUG-156 覆盖 core `Tensor::get` 对标量非零索引的参数忽略问题；B
 | BUG-158 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::repeat((0, 1))` 把 0 repeat factor 当作 1 并返回原 shape | 入口拒绝任一零 repeat factor |
 | BUG-159 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `slice_scatter0(src, usize::MAX)` 在 `d2 + start` 处溢出 panic | 用 `checked_add` 做 shape 范围校验 |
 | BUG-160 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `slice_scatter(src, dim != 0, usize::MAX)` 经 transpose 后同样溢出 panic | 同一 `slice_scatter0` 修复覆盖非零维路径 |
+| BUG-161 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `slice_assign(&[0..=usize::MAX, ...])` 在 inclusive end 转换中溢出 panic | `Bound::Included` 上界用 `checked_add(1)` |
+| BUG-162 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `slice_assign` 的 excluded start 为 `usize::MAX` 时 `v + 1` 溢出 panic | `Bound::Excluded` 下界用 `checked_add(1)` |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -3056,7 +3059,62 @@ git diff --check
 - `agent/bug-159-slice-scatter-start-overflow`
 - `agent/bug-160-slice-scatter-nonzero-dim-start-overflow`
 
-## 一百六十个案例教什么
+## BUG-161 到 BUG-162：`slice_assign` 的 range bound 转换溢出
+
+受影响文件：
+
+- [candle-core/src/tensor.rs](../candle-core/src/tensor.rs)
+- [candle-core/tests/indexing_tests.rs](../candle-core/tests/indexing_tests.rs)
+
+`slice_assign(ranges, src)` 接收的是 Rust 标准库的 `RangeBounds<usize>`。为了把各种 range 统一成
+`start_included..end_excluded`，旧实现会做：
+
+```rust
+let start_included = match range.start_bound() {
+    Bound::Excluded(v) => *v + 1,
+    ...
+};
+let end_excluded = match range.end_bound() {
+    Bound::Included(v) => *v + 1,
+    ...
+};
+```
+
+这在普通 range 上没问题，但极端边界会溢出：
+
+- `0..=usize::MAX` 的 inclusive end 要转成 exclusive end，`usize::MAX + 1` panic。
+- `(Bound::Excluded(usize::MAX), Bound::Unbounded)` 的 excluded start 也要 `+ 1`，同样 panic。
+
+这类 bug 很适合训练 Rust 边界意识：标准库 range 类型本身可以表达这些边界值，库代码不能假设
+`+ 1` 永远安全。
+
+修复策略：
+
+1. `Bound::Excluded(v)` 下界用 `v.checked_add(1)`。
+2. `Bound::Included(v)` 上界也用 `v.checked_add(1)`。
+3. 溢出时返回 `slice-assign: ... bound overflows`。
+4. 后续空 range、越界、src shape mismatch 的原有校验顺序保持不变。
+
+新增测试：
+
+- `slice_assign_rejects_inclusive_end_overflow`
+- `slice_assign_rejects_excluded_start_overflow`
+
+修复后验证：
+
+```bash
+cargo test -p candle-core --test indexing_tests slice_assign_rejects_ -- --nocapture
+cargo test -p candle-core --test indexing_tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-161-slice-assign-bound-overflow`
+- `agent/bug-162-slice-assign-start-bound-overflow`
+
+## 一百六十二个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
@@ -3072,6 +3130,7 @@ git diff --check
 - 不是所有 bug 都表现为 panic；如果 public API 忽略了调用方传入的参数，也要用 UT 钉住。
 - 当一个 API 的参数列表和 Tensor rank 对齐时，必须校验长度；少传维度不能被当成默认值。
 - `start + len` 这类范围校验要优先用 `checked_add` 或 `saturating_add`，不能先让 `usize` 溢出。
+- `RangeBounds` 的 included/excluded 转换本质也是算术，`v + 1` 同样需要 checked arithmetic。
 - Tensor rank 正确不代表每个维度都非空。
 - 文档注释引用外部 API 时，行为应该尽量匹配读者预期。
 - 模型加载代码里不应该用 `unwrap()` 处理 checkpoint 错误。
