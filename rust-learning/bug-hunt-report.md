@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百五十个 public API 边界修复
+# Candle bug hunt 报告：一百五十五个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百五十个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百五十五个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -24,7 +24,7 @@ distribution 参数通道合同；BUG-138 覆盖 core `Tensor::chunk` 的零 chu
 BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断合同；BUG-141 到 BUG-142
 覆盖 core `Tensor::var` 的 unbiased reduction 样本数合同；BUG-143 到 BUG-146 覆盖 core
 2D pooling 的 stride/kernel 参数合同；BUG-147 到 BUG-150 覆盖 bilinear upsample scale
-到输出尺寸的派生合同。
+到输出尺寸的派生合同；BUG-151 到 BUG-155 覆盖 upsample 空输入空间维合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -185,6 +185,11 @@ BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断�
 | BUG-148 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | 负数 bilinear scale 被 cast 成 0 输出维度 | 同一校验拒绝负 scale |
 | BUG-149 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | NaN bilinear scale 被 cast 成 0 输出维度 | 同一校验拒绝非有限 scale |
 | BUG-150 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | 很小的正 scale 经 `floor` 后派生出 0 输出尺寸 | scale 合法后还要校验输出尺寸非零 |
+| BUG-151 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `upsample_nearest1d` 对空输入 length 在 `src_sz - 1` 处下溢 panic | nearest 1D 入口拒绝空输入 length |
+| BUG-152 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `upsample_nearest2d` 对空输入 height 在 `src_h - 1` 处下溢 panic | nearest 2D 入口拒绝空输入 height |
+| BUG-153 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `upsample_nearest2d` 对空输入 width 在 `src_w - 1` 处下溢 panic | nearest 2D 入口拒绝空输入 width |
+| BUG-154 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `upsample_bilinear2d` 对空输入 height 在邻点索引计算中下溢 panic | bilinear 入口拒绝空输入 height |
+| BUG-155 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `upsample_bilinear2d` 对空输入 width 在邻点索引计算中下溢 panic | bilinear 入口拒绝空输入 width |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2830,7 +2835,70 @@ git diff --check
 - `agent/bug-149-bilinear-nan-scale`
 - `agent/bug-150-bilinear-zero-output-scale`
 
-## 一百五十个案例教什么
+## BUG-151 到 BUG-155：upsample 的空输入空间维
+
+受影响文件：
+
+- [candle-core/src/tensor.rs](../candle-core/src/tensor.rs)
+- [candle-core/tests/pool_tests.rs](../candle-core/tests/pool_tests.rs)
+- [candle-core/tests/bilinear_tests.rs](../candle-core/tests/bilinear_tests.rs)
+
+nearest 和 bilinear upsample 都需要从输出位置映射回输入位置。这个映射最终会用到输入最后一个有效
+索引，也就是 `src_dim - 1`。旧实现没有在 Tensor 入口拒绝空空间维，导致 CPU backend 里出现
+`usize` 下溢：
+
+```text
+upsample_nearest1d: src_sz - 1
+upsample_nearest2d: src_h - 1 / src_w - 1
+upsample_bilinear2d: height_in - 1 / width_in - 1
+```
+
+可复现输入：
+
+- `[1, 1, 0]` 调 `upsample_nearest1d(1)`。
+- `[1, 1, 0, 2]` 调 `upsample_nearest2d(1, 2)`。
+- `[1, 1, 2, 0]` 调 `upsample_nearest2d(2, 1)`。
+- `[1, 1, 0, 2]` 调 `upsample_bilinear2d(1, 2, false)`。
+- `[1, 1, 2, 0]` 调 `upsample_bilinear2d(2, 1, false)`。
+
+这类 bug 的关键判断是：rank 正确不代表空间维非空。`dims3()` / `dims4()` 只能证明 Tensor 有三维或四维，
+不能证明 `L/H/W > 0`。而 upsample 的采样语义要求输入至少有一个可采样位置。
+
+修复策略：
+
+1. 新增 `check_upsample1d_input`，要求输入 length 非零。
+2. 新增 `check_upsample2d_input`，要求输入 height/width 都非零。
+3. 在 nearest1d、nearest2d、bilinear size 和 bilinear scale 入口统一调用。
+4. 保持正常 upsample 的输出数值和维度测试不变。
+
+新增测试：
+
+- `upsample_nearest1d_rejects_empty_length`
+- `upsample_nearest2d_rejects_empty_height`
+- `upsample_nearest2d_rejects_empty_width`
+- `bilinear_rejects_empty_input_height`
+- `bilinear_rejects_empty_input_width`
+
+修复后验证：
+
+```bash
+cargo test -p candle-core --test pool_tests upsample_nearest -- --nocapture
+cargo test -p candle-core --test bilinear_tests bilinear_rejects_empty_input -- --nocapture
+cargo test -p candle-core --test pool_tests
+cargo test -p candle-core --test bilinear_tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-151-upsample-empty-input-validation`
+- `agent/bug-152-nearest2d-empty-input-height`
+- `agent/bug-153-nearest2d-empty-input-width`
+- `agent/bug-154-bilinear-empty-input-height`
+- `agent/bug-155-bilinear-empty-input-width`
+
+## 一百五十五个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
@@ -2842,6 +2910,7 @@ git diff --check
 - 统计类 API 要把数学定义里的样本数条件写成代码合同，例如 unbiased variance 需要 `n >= 2`。
 - Pooling/conv 这类窗口 API 要同时校验 kernel、stride 和输入空间尺寸，不能只检查其中一个。
 - 浮点参数进入 shape 计算前要先检查有限性和取值范围，cast 成 `usize` 后还要检查派生尺寸。
+- 采样类 API 要先证明输入空间维至少有一个可采样位置，再计算 `src_dim - 1` 或邻点索引。
 - Tensor rank 正确不代表每个维度都非空。
 - 文档注释引用外部 API 时，行为应该尽量匹配读者预期。
 - 模型加载代码里不应该用 `unwrap()` 处理 checkpoint 错误。

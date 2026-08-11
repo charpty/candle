@@ -313,7 +313,7 @@ cargo run -p candle-examples --example rust-candle-tour -- --cpu
 
 ## 10. 真实 bug 案例
 
-这次 bug hunt 累计修了 150 个 public API 边界问题，覆盖 Candle 的三十四条典型边界：
+这次 bug hunt 累计修了 155 个 public API 边界问题，覆盖 Candle 的三十五条典型边界：
 
 | bug | 所在层 | 教学价值 |
 | --- | --- | --- |
@@ -325,6 +325,7 @@ cargo run -p candle-examples --example rust-candle-tour -- --cpu
 | `Tensor::var` 空/单元素 reduction | `candle-core` Tensor reduction API | unbiased variance 的分母是 `n - 1`；统计定义里的 `n >= 2` 必须先写成代码合同，避免 `usize` 下溢和 NaN。 |
 | `avg_pool2d` / `max_pool2d` 零 kernel/stride | `candle-core` Tensor pooling API | pooling 输出 shape 同时依赖 kernel、stride 和输入尺寸；窗口合同要在进入 backend 前统一闭合。 |
 | `upsample_bilinear2d_with_scale` 非法 scale | `candle-core` Tensor upsample API | `f64` scale 进入 shape 计算前要检查有限正数，派生出的输出尺寸也要再次校验非零。 |
+| nearest/bilinear upsample 空输入空间维 | `candle-core` Tensor upsample API | 采样映射会用到 `src_dim - 1`；rank 校验后仍要证明输入 L/H/W 非空。 |
 | `Cache` / `RotatingCache` 零容量 | `candle-nn` KV cache | `grow_by = 0` 会死循环，rotating index 会取模零；长期保留的 UT 要能避免测试进程卡死。 |
 | `KvCache` / `RotatingKvCache` / `ConcatKvCache` 失败半更新 | `candle-nn` KV cache | 有状态组件的 fallible append 必须是失败原子性的，不能 K 成功、V 失败后污染请求态。 |
 | `ScatteredCacheBuilder` batch mask 长度 | `candle-nn` KV cache | batch 级输入要显式校验长度，否则短 mask 静默错形状，长 mask 越界 panic。 |
@@ -447,7 +448,7 @@ decode step。修复时不能只让当前调用返回 `Err`，还要断言失败
 这批案例的判断口径更严格：不是“配置不推荐”，而是构造函数内部会直接除零、静默截断必要维度，
 或在返回 `Result<Self>` 的加载函数里 panic。详细复现和修复见 [bug-hunt-report.md](./bug-hunt-report.md)。
 
-这 150 个 bug 值得放进学习资料，因为它们展示了 Rust/Candle 源码审计的正确顺序：
+这 155 个 bug 值得放进学习资料，因为它们展示了 Rust/Candle 源码审计的正确顺序：
 
 1. 先看 public API 签名。返回 `Result` 的函数不应该轻易 panic。
 2. 再看 shape 合同。4D Tensor 不等于空间维度一定非空。
