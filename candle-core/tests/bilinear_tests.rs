@@ -406,6 +406,58 @@ fn bilinear_output_dimensions(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn bilinear_rejects_zero_height_scale() -> Result<()> {
+    let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
+    let err = t
+        .upsample_bilinear2d_with_scale(0.0, 1.0, false)
+        .expect_err("bilinear upsample should reject a zero height scale");
+    assert!(
+        err.to_string().contains("scale"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn bilinear_rejects_negative_width_scale() -> Result<()> {
+    let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
+    let err = t
+        .upsample_bilinear2d_with_scale(1.0, -1.0, false)
+        .expect_err("bilinear upsample should reject a negative width scale");
+    assert!(
+        err.to_string().contains("scale"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn bilinear_rejects_nan_height_scale() -> Result<()> {
+    let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
+    let err = t
+        .upsample_bilinear2d_with_scale(f64::NAN, 1.0, false)
+        .expect_err("bilinear upsample should reject a NaN height scale");
+    assert!(
+        err.to_string().contains("scale"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn bilinear_rejects_scale_with_zero_output_size() -> Result<()> {
+    let t = Tensor::arange(0f32, 16f32, &Device::Cpu)?.reshape((1, 1, 4, 4))?;
+    let err = t
+        .upsample_bilinear2d_with_scale(0.1, 1.0, false)
+        .expect_err("bilinear upsample should reject scales producing a zero output size");
+    assert!(
+        err.to_string().contains("output"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
 // ============================================================================
 // Special Behavior Tests
 // ============================================================================

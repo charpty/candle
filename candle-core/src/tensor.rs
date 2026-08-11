@@ -1296,10 +1296,20 @@ impl Tensor {
         align_corners: bool,
     ) -> Result<Self> {
         let (n, c, height_in, width_in) = self.dims4()?;
+        if !scale_h.is_finite() || !scale_w.is_finite() || scale_h <= 0. || scale_w <= 0. {
+            bail!(
+                "upsample_bilinear2d_with_scale: scale factors must be finite and positive, got ({scale_h}, {scale_w})"
+            )
+        }
 
         // Calculate output size (floor, matching PyTorch)
         let height_out = (height_in as f64 * scale_h).floor() as usize;
         let width_out = (width_in as f64 * scale_w).floor() as usize;
+        if height_out == 0 || width_out == 0 {
+            bail!(
+                "upsample_bilinear2d_with_scale: output size must be non-zero, got ({height_out}, {width_out})"
+            )
+        }
 
         // Early return if size unchanged
         if height_in == height_out && width_in == width_out {
