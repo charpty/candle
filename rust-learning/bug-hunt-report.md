@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百三十八个 public API 边界修复
+# Candle bug hunt 报告：一百四十个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百三十八个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百四十个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -21,6 +21,7 @@ PaddleOCR-VL glue 层多模态输入配对和列表长度合同；BUG-129 到 BU
 多模态元数据和 placeholder span 半配对合同；BUG-133 到 BUG-134 覆盖 Stable Diffusion
 UNet/VAE 构造期空 block 配置；BUG-135 到 BUG-137 覆盖 Stable Diffusion VAE latent
 distribution 参数通道合同；BUG-138 覆盖 core `Tensor::chunk` 的零 chunks 参数。
+BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -169,6 +170,8 @@ distribution 参数通道合同；BUG-138 覆盖 core `Tensor::chunk` 的零 chu
 | BUG-136 | [candle-transformers/src/models/stable_diffusion/vae.rs](../candle-transformers/src/models/stable_diffusion/vae.rs) | VAE distribution 只有 1 个参数通道时第二个 chunk 缺失并 panic | 同一入口拒绝单通道参数 |
 | BUG-137 | [candle-transformers/src/models/stable_diffusion/vae.rs](../candle-transformers/src/models/stable_diffusion/vae.rs) | 奇数参数通道被拆成不等长 mean/logvar 后仍返回 Ok | 拒绝奇数通道，保证 mean/logvar 等长 |
 | BUG-138 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::chunk(0, dim)` 在 `size / chunks` 处除零 panic | 入口拒绝零 chunks |
+| BUG-139 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::unfold(..., step = 0)` 通过浮点除零生成 `usize::MAX` 维度 | 入口拒绝零 step，并用整数公式计算窗口数 |
+| BUG-140 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::unfold` 的 size 越界错误把 op 名写成 `unsqueeze` | 错误信息改为 `unfold`，让调用方能定位真实 API |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2558,13 +2561,88 @@ git diff --check
 
 - `agent/bug-138-tensor-chunk-zero-chunks`
 
-## 一百三十八个案例教什么
+## BUG-139 到 BUG-140：`Tensor::unfold` 的步长和错误诊断合同
+
+受影响文件：
+
+- [candle-core/src/tensor.rs](../candle-core/src/tensor.rs)
+- [candle-core/tests/tensor_tests.rs](../candle-core/tests/tensor_tests.rs)
+
+`Tensor::unfold(dim, size, step)` 返回一个 view：它不会复制底层 storage，而是通过新的 shape 和 stride
+描述“沿某个维度滑动窗口”。这类 API 的危险点在于：参数不是只影响数值结果，而是直接参与 layout
+构造。一旦 shape/stride 算错，后续所有算子都会相信这个 view 是合法 Tensor。
+
+旧实现的关键代码是：
+
+```rust
+sizes[dim] = ((sizes[dim] as f32 - size as f32) / step as f32 + 1.) as usize;
+strides[dim] *= step;
+```
+
+这里有两个问题。
+
+第一，`step` 是 `usize`，但没有先排除 0。`step = 0` 被转成 `0.0f32` 后，计算变成浮点除零。
+在复现测试中，`Tensor::zeros((2, 3), ...)?.unfold(1, 1, 0)` 没有返回 `Err`，而是构造出类似
+`Tensor[dims 2, 18446744073709551615, 1; f32]` 的无效大 shape。公共 `Result` API 不应该把普通非法参数
+变成这种后续才爆炸的 Tensor view。
+
+第二，`size > max_len` 的错误信息写成了 `unsqueeze`：
+
+```rust
+bail!("unsqueeze: maximum size for tensor at dimension ...")
+```
+
+这不是单纯文案瑕疵。Candle 的错误链常被上层框架、Python binding、服务日志直接展示；op 名错了，
+调用方会沿着错误路径去查 `unsqueeze`，而真正的参数问题发生在 `unfold`。
+
+修复策略：
+
+1. 在 `dim` 转成真实轴之后立即检查 `step == 0`。
+2. 用 `bail!("unfold: step cannot be zero")` 保持 Candle 一贯的 `Result` 错误传播。
+3. 把越界 `size` 的错误前缀从 `unsqueeze` 改成 `unfold`。
+4. 把窗口数公式改成整数运算：`(sizes[dim] - size) / step + 1`。
+
+最后一点尤其值得学。Shape 是离散整数合同，不能为了写起来方便转成 `f32`。浮点数会引入三个额外风险：
+
+- `0` divisor 会变成 `inf`，再 cast 回 `usize`，错误被延迟并放大。
+- 大于 `2^24` 的 `usize` 转 `f32` 会丢精度，窗口数量可能差 1 或更多。
+- shape 计算本来就不需要小数；整数公式更贴近 API 语义，也更容易审计。
+
+新增测试：
+
+- `unfold_rejects_zero_step`
+- `unfold_size_error_mentions_unfold`
+
+修复前测试失败形态：
+
+```text
+unfold should reject a zero step: Tensor[dims 2, 18446744073709551615, 1; f32]
+unexpected error message: unsqueeze: maximum size for tensor at dimension 1 is 3 but size is 4
+```
+
+修复后验证：
+
+```bash
+cargo test -p candle-core --test tensor_tests unfold_ -- --nocapture
+cargo test -p candle-core --test tensor_tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-139-tensor-unfold-validation`
+- `agent/bug-140-tensor-unfold-error-message`
+
+## 一百四十个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
 - Public API 返回 `Result`，就要主动检查普通非法输入是否会绕过 `Result` 变成 panic。
 - `usize` 除法要先排除 0 factor。
 - `usize` 的 `len - 1` 是 Rust 代码里常见边界风险点。
+- Tensor view API 的 shape/stride 参数必须先验证再构造；一旦 view 返回 `Ok`，后续算子会信任它。
+- Shape 计算尽量用整数公式，不要把离散维度转成 `f32` 再 cast 回 `usize`。
 - Tensor rank 正确不代表每个维度都非空。
 - 文档注释引用外部 API 时，行为应该尽量匹配读者预期。
 - 模型加载代码里不应该用 `unwrap()` 处理 checkpoint 错误。
