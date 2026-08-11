@@ -2222,7 +2222,16 @@ impl Tensor {
     pub fn get(&self, i: usize) -> Result<Tensor> {
         let dims = self.dims();
         if dims.is_empty() {
-            Ok(self.clone())
+            if i == 0 {
+                Ok(self.clone())
+            } else {
+                Err(Error::InvalidIndex {
+                    op: "get",
+                    index: i,
+                    size: 1,
+                }
+                .bt())
+            }
         } else {
             self.narrow(0, i, 1)?.reshape(&dims[1..])
         }

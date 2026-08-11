@@ -2093,6 +2093,20 @@ fn tensor_new() -> Result<()> {
 }
 
 #[test]
+fn get_scalar_rejects_nonzero_index() -> Result<()> {
+    let t = Tensor::new(1f32, &Device::Cpu)?;
+    let err = t
+        .get(1)
+        .expect_err("scalar get should reject non-zero indexes");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("get") && msg.contains("invalid index"),
+        "unexpected error message: {msg}"
+    );
+    Ok(())
+}
+
+#[test]
 fn tensor_norm() -> Result<()> {
     let t = Tensor::new(&[[3., 4.], [0., 0.]], &Device::Cpu)?;
     let norm = t.norm()?;
