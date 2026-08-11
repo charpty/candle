@@ -2093,6 +2093,32 @@ fn tensor_new() -> Result<()> {
 }
 
 #[test]
+fn repeat_rejects_too_few_dimensions() -> Result<()> {
+    let t = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
+    let err = t
+        .repeat(2)
+        .expect_err("repeat should reject fewer repeat dimensions than tensor rank");
+    assert!(
+        err.to_string().contains("repeat"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn repeat_rejects_zero_repeats() -> Result<()> {
+    let t = Tensor::zeros((2, 3), DType::F32, &Device::Cpu)?;
+    let err = t
+        .repeat((0, 1))
+        .expect_err("repeat should reject zero repeat factors");
+    assert!(
+        err.to_string().contains("repeat"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn tensor_norm() -> Result<()> {
     let t = Tensor::new(&[[3., 4.], [0., 0.]], &Device::Cpu)?;
     let norm = t.norm()?;

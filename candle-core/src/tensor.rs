@@ -689,6 +689,17 @@ impl Tensor {
         // Similar to PyTorch, we extend the number of dimensions of self if needed.
         let repeats = shape.into();
         let repeats = repeats.dims();
+        if repeats.len() < self.rank() {
+            bail!(
+                "repeat: expected at least {} repeat dimensions for tensor {:?}, got {}",
+                self.rank(),
+                self.dims(),
+                repeats.len()
+            )
+        }
+        if let Some((dim, _)) = repeats.iter().enumerate().find(|(_, &repeat)| repeat == 0) {
+            bail!("repeat: repeat factor for dim {dim} must be non-zero")
+        }
         let mut inp = if self.rank() < repeats.len() {
             let shape = [vec![1; repeats.len() - self.rank()], self.dims().to_vec()].concat();
             self.reshape(shape)?
