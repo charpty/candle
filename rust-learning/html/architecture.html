@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：155 个 public API 边界</h2>
+          <h2>真实修复：156 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -247,6 +247,10 @@
           <article class="bug-card">
             <h3>BUG-151/155</h3>
             <p>nearest/bilinear upsample 在采样前拒绝空输入空间维，避免 `src_dim - 1` 下溢。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-156</h3>
+            <p>`Tensor::get(1)` 对标量不再静默返回自身，而是返回明确的 invalid index 错误。</p>
           </article>
           <article class="bug-card">
             <h3>BUG-004</h3>
