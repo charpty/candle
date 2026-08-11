@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百五十六个 public API 边界修复
+# Candle bug hunt 报告：一百五十八个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百五十六个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百五十八个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -25,7 +25,8 @@ BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断�
 覆盖 core `Tensor::var` 的 unbiased reduction 样本数合同；BUG-143 到 BUG-146 覆盖 core
 2D pooling 的 stride/kernel 参数合同；BUG-147 到 BUG-150 覆盖 bilinear upsample scale
 到输出尺寸的派生合同；BUG-151 到 BUG-155 覆盖 upsample 空输入空间维合同。
-BUG-156 覆盖 core `Tensor::get` 对标量非零索引的参数忽略问题。
+BUG-156 覆盖 core `Tensor::get` 对标量非零索引的参数忽略问题；BUG-157 到 BUG-158
+覆盖 core `Tensor::repeat` 的 repeat 维数和零 factor 合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -192,6 +193,8 @@ BUG-156 覆盖 core `Tensor::get` 对标量非零索引的参数忽略问题。
 | BUG-154 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `upsample_bilinear2d` 对空输入 height 在邻点索引计算中下溢 panic | bilinear 入口拒绝空输入 height |
 | BUG-155 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `upsample_bilinear2d` 对空输入 width 在邻点索引计算中下溢 panic | bilinear 入口拒绝空输入 width |
 | BUG-156 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | 标量 Tensor 调 `get(1)` 会忽略索引并返回自身 | 保留 `get(0)` 兼容，非零索引返回 `InvalidIndex` |
+| BUG-157 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::repeat(2)` 对二维 Tensor 静默只 repeat 第 0 维 | 要求 repeat 维数至少等于 Tensor rank |
+| BUG-158 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::repeat((0, 1))` 把 0 repeat factor 当作 1 并返回原 shape | 入口拒绝任一零 repeat factor |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2943,7 +2946,67 @@ git diff --check
 
 - `agent/bug-156-tensor-get-scalar-index`
 
-## 一百五十六个案例教什么
+## BUG-157 到 BUG-158：`Tensor::repeat` 的维数和零 factor 合同
+
+受影响文件：
+
+- [candle-core/src/tensor.rs](../candle-core/src/tensor.rs)
+- [candle-core/tests/tensor_tests.rs](../candle-core/tests/tensor_tests.rs)
+
+`Tensor::repeat(shape)` 的语义是按每个维度的 repeat factor 扩展 Tensor。旧实现有一个危险的隐含假设：
+
+```rust
+let repeats = shape.into();
+let repeats = repeats.dims();
+let mut inp = if self.rank() < repeats.len() {
+    let shape = [vec![1; repeats.len() - self.rank()], self.dims().to_vec()].concat();
+    self.reshape(shape)?
+} else {
+    self.clone()
+};
+for (idx, &repeat) in repeats.iter().enumerate() {
+    if repeat > 1 {
+        inp = Tensor::cat(&vec![&inp; repeat], idx)?
+    }
+}
+```
+
+这里有两个问题。
+
+第一，repeat 维数少于 Tensor rank 时没有报错。二维 `[2, 3]` Tensor 调 `repeat(2)` 会被当成只 repeat
+第 0 维，返回 `[4, 3]`。调用方少传了一个维度，API 却静默给出另一个合法 shape，这比直接报错更容易
+污染后续模型逻辑。
+
+第二，repeat factor 为 0 时被 `if repeat > 1` 吞掉。`repeat((0, 1))` 对 `[2, 3]` 返回原 shape
+`[2, 3]`，等价于把 0 当作 1。无论库最终选择支持空输出还是拒绝 0，都不能静默忽略这个参数。
+
+修复策略：
+
+1. 要求 `repeats.len() >= self.rank()`。
+2. 要求每个 repeat factor 都非零。
+3. 保持 repeat 维数更多时“左侧补 1 维”的既有语义。
+4. 保持 repeat factor 为 1 时不复制的既有优化。
+
+新增测试：
+
+- `repeat_rejects_too_few_dimensions`
+- `repeat_rejects_zero_repeats`
+
+修复后验证：
+
+```bash
+cargo test -p candle-core --test tensor_tests repeat_rejects_ -- --nocapture
+cargo test -p candle-core --test tensor_tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-157-tensor-repeat-validation`
+- `agent/bug-158-tensor-repeat-zero-factor`
+
+## 一百五十八个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
@@ -2957,6 +3020,7 @@ git diff --check
 - 浮点参数进入 shape 计算前要先检查有限性和取值范围，cast 成 `usize` 后还要检查派生尺寸。
 - 采样类 API 要先证明输入空间维至少有一个可采样位置，再计算 `src_dim - 1` 或邻点索引。
 - 不是所有 bug 都表现为 panic；如果 public API 忽略了调用方传入的参数，也要用 UT 钉住。
+- 当一个 API 的参数列表和 Tensor rank 对齐时，必须校验长度；少传维度不能被当成默认值。
 - Tensor rank 正确不代表每个维度都非空。
 - 文档注释引用外部 API 时，行为应该尽量匹配读者预期。
 - 模型加载代码里不应该用 `unwrap()` 处理 checkpoint 错误。
