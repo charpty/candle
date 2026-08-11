@@ -33,6 +33,45 @@ fn max_pool2d(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn upsample_nearest1d_rejects_empty_length() -> Result<()> {
+    let t = Tensor::from_vec(Vec::<f32>::new(), (1, 1, 0), &Device::Cpu)?;
+    let err = t
+        .upsample_nearest1d(1)
+        .expect_err("nearest 1d upsample should reject an empty input length");
+    assert!(
+        err.to_string().contains("input"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn upsample_nearest2d_rejects_empty_height() -> Result<()> {
+    let t = Tensor::from_vec(Vec::<f32>::new(), (1, 1, 0, 2), &Device::Cpu)?;
+    let err = t
+        .upsample_nearest2d(1, 2)
+        .expect_err("nearest 2d upsample should reject an empty input height");
+    assert!(
+        err.to_string().contains("input"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn upsample_nearest2d_rejects_empty_width() -> Result<()> {
+    let t = Tensor::from_vec(Vec::<f32>::new(), (1, 1, 2, 0), &Device::Cpu)?;
+    let err = t
+        .upsample_nearest2d(2, 1)
+        .expect_err("nearest 2d upsample should reject an empty input width");
+    assert!(
+        err.to_string().contains("input"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
 /* This test corresponds to the following PyTorch script.
 import torch
 torch.manual_seed(4242)

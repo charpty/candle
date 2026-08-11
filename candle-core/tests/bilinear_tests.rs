@@ -406,6 +406,32 @@ fn bilinear_output_dimensions(dev: &Device) -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn bilinear_rejects_empty_input_height() -> Result<()> {
+    let t = Tensor::from_vec(Vec::<f32>::new(), (1, 1, 0, 2), &Device::Cpu)?;
+    let err = t
+        .upsample_bilinear2d(1, 2, false)
+        .expect_err("bilinear upsample should reject an empty input height");
+    assert!(
+        err.to_string().contains("input"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn bilinear_rejects_empty_input_width() -> Result<()> {
+    let t = Tensor::from_vec(Vec::<f32>::new(), (1, 1, 2, 0), &Device::Cpu)?;
+    let err = t
+        .upsample_bilinear2d(2, 1, false)
+        .expect_err("bilinear upsample should reject an empty input width");
+    assert!(
+        err.to_string().contains("input"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
 // ============================================================================
 // Special Behavior Tests
 // ============================================================================

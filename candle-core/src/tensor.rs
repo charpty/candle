@@ -1177,12 +1177,27 @@ impl Tensor {
         self.maximum(min)?.minimum(max)
     }
 
+    fn check_upsample1d_input(op: &'static str, len: usize) -> Result<()> {
+        if len == 0 {
+            bail!("{op}: input length must be non-zero")
+        }
+        Ok(())
+    }
+
+    fn check_upsample2d_input(op: &'static str, h: usize, w: usize) -> Result<()> {
+        if h == 0 || w == 0 {
+            bail!("{op}: input spatial dimensions must be non-zero, got ({h}, {w})")
+        }
+        Ok(())
+    }
+
     /// Interpolate the input tensor to the `target_size` size, taking the value of the nearest element.
     ///
     /// The input tensor should have three dimensions, `(batch, channels, l)`, the returned
     /// tensor also has three dimensions, `(batch, channels, target_size)`.
     pub fn interpolate1d(&self, target_size: usize) -> Result<Self> {
-        let (n, c, _l) = self.dims3()?;
+        let (n, c, l) = self.dims3()?;
+        Self::check_upsample1d_input("upsample_nearest1d", l)?;
         let op = BackpropOp::new1(self, |arg| Op::UpsampleNearest1D { arg, target_size });
         let storage = self
             .storage()
@@ -1201,7 +1216,8 @@ impl Tensor {
     /// The input tensor should have four dimensions, `(batch, channels, h, w)`, the returned
     /// tensor also has four dimensions, `(batch, channels, target_h, target_w)`.
     pub fn interpolate2d(&self, target_h: usize, target_w: usize) -> Result<Self> {
-        let (n, c, _h, _w) = self.dims4()?;
+        let (n, c, h, w) = self.dims4()?;
+        Self::check_upsample2d_input("upsample_nearest2d", h, w)?;
         let op = BackpropOp::new1(self, |arg| Op::UpsampleNearest2D {
             arg,
             target_h,
@@ -1247,7 +1263,8 @@ impl Tensor {
         target_w: usize,
         align_corners: bool,
     ) -> Result<Self> {
-        let (n, c, _h, _w) = self.dims4()?;
+        let (n, c, h, w) = self.dims4()?;
+        Self::check_upsample2d_input("upsample_bilinear2d", h, w)?;
         let op = BackpropOp::new1(self, |arg| Op::UpsampleBilinear2D {
             arg,
             target_h,
@@ -1296,6 +1313,7 @@ impl Tensor {
         align_corners: bool,
     ) -> Result<Self> {
         let (n, c, height_in, width_in) = self.dims4()?;
+        Self::check_upsample2d_input("upsample_bilinear2d_with_scale", height_in, width_in)?;
 
         // Calculate output size (floor, matching PyTorch)
         let height_out = (height_in as f64 * scale_h).floor() as usize;
