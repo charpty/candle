@@ -480,6 +480,32 @@ fn var(device: &Device) -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn var_rejects_empty_reduction_dim() -> Result<()> {
+    let tensor = Tensor::zeros((0, 2), DType::F32, &Device::Cpu)?;
+    let err = tensor
+        .var_keepdim(0)
+        .expect_err("unbiased variance should reject an empty reduction dimension");
+    assert!(
+        err.to_string().contains("at least two"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn var_rejects_singleton_reduction_dim() -> Result<()> {
+    let tensor = Tensor::zeros((1, 2), DType::F32, &Device::Cpu)?;
+    let err = tensor
+        .var(0)
+        .expect_err("unbiased variance should reject a singleton reduction dimension");
+    assert!(
+        err.to_string().contains("at least two"),
+        "unexpected error message: {err:?}"
+    );
+    Ok(())
+}
+
 fn sum(device: &Device) -> Result<()> {
     let data = &[[[3u32, 1, 4], [1, 5, 9]], [[2, 1, 7], [8, 2, 8]]];
     let tensor = Tensor::new(data, device)?;

@@ -1067,9 +1067,13 @@ impl Tensor {
     /// Returns the unbiased variance over the selected dimension.
     pub fn var_keepdim<D: Dim>(&self, dim: D) -> Result<Self> {
         let dim = dim.to_index(self.shape(), "var")?;
+        let dim_len = self.dim(dim)?;
+        if dim_len < 2 {
+            bail!("var: expected at least two elements on dim {dim}, got {dim_len}")
+        }
         let mean = self.mean_keepdim(dim)?;
         let squares = self.broadcast_sub(&mean)?.sqr()?;
-        squares.sum_impl(dim, true)? / (self.dim(dim)? - 1) as f64
+        squares.sum_impl(dim, true)? / (dim_len - 1) as f64
     }
 
     /// Returns the unbiased variance over the selected dimension.
