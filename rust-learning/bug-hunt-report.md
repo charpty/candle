@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百四十个 public API 边界修复
+# Candle bug hunt 报告：一百四十二个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百四十个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百四十二个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -21,7 +21,8 @@ PaddleOCR-VL glue 层多模态输入配对和列表长度合同；BUG-129 到 BU
 多模态元数据和 placeholder span 半配对合同；BUG-133 到 BUG-134 覆盖 Stable Diffusion
 UNet/VAE 构造期空 block 配置；BUG-135 到 BUG-137 覆盖 Stable Diffusion VAE latent
 distribution 参数通道合同；BUG-138 覆盖 core `Tensor::chunk` 的零 chunks 参数。
-BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断合同。
+BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断合同；BUG-141 到 BUG-142
+覆盖 core `Tensor::var` 的 unbiased reduction 样本数合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -172,6 +173,8 @@ BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断�
 | BUG-138 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::chunk(0, dim)` 在 `size / chunks` 处除零 panic | 入口拒绝零 chunks |
 | BUG-139 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::unfold(..., step = 0)` 通过浮点除零生成 `usize::MAX` 维度 | 入口拒绝零 step，并用整数公式计算窗口数 |
 | BUG-140 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::unfold` 的 size 越界错误把 op 名写成 `unsqueeze` | 错误信息改为 `unfold`，让调用方能定位真实 API |
+| BUG-141 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::var_keepdim` 在空 reduction 维上计算 `dim_len - 1` 下溢 panic | unbiased variance 入口要求 reduction 长度至少为 2 |
+| BUG-142 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::var` 在单元素 reduction 维上除以 0 并返回 NaN | 同一校验拒绝单元素样本，避免非有限结果 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -2634,7 +2637,67 @@ git diff --check
 - `agent/bug-139-tensor-unfold-validation`
 - `agent/bug-140-tensor-unfold-error-message`
 
-## 一百四十个案例教什么
+## BUG-141 到 BUG-142：`Tensor::var` 的 reduction 样本数合同
+
+受影响文件：
+
+- [candle-core/src/tensor.rs](../candle-core/src/tensor.rs)
+- [candle-core/tests/tensor_tests.rs](../candle-core/tests/tensor_tests.rs)
+
+`Tensor::var(dim)` 和 `Tensor::var_keepdim(dim)` 的注释写得很明确：它们返回的是 unbiased variance。
+无偏样本方差的分母是 `n - 1`，所以 reduction 维度上至少要有两个样本。旧实现没有把这个统计学合同
+转成 API 校验：
+
+```rust
+let mean = self.mean_keepdim(dim)?;
+let squares = self.broadcast_sub(&mean)?.sqr()?;
+squares.sum_impl(dim, true)? / (self.dim(dim)? - 1) as f64
+```
+
+这里暴露两个不同失败形态。
+
+第一，`dim_len = 0` 时，`self.dim(dim)? - 1` 是 `usize` 下溢。debug 构建会 panic：
+
+```text
+attempt to subtract with overflow
+```
+
+第二，`dim_len = 1` 时，分母是 0。旧代码不会返回 `Err`，而是产生非有限结果：
+
+```text
+Tensor[NaN, NaN; f32]
+```
+
+这两个都不该从 public `Result` API 泄漏出去。空样本是普通非法输入，单样本对 unbiased variance
+也没有定义；它们都应该在入口变成明确错误。
+
+修复策略：
+
+1. `dim.to_index` 后先读取 `dim_len`。
+2. 如果 `dim_len < 2`，返回 `bail!("var: expected at least two elements ...")`。
+3. 只有合同满足后才计算 mean、平方差和 `dim_len - 1`。
+4. 复用同一校验覆盖 `var_keepdim` 和调用它的 `var`。
+
+新增测试：
+
+- `var_rejects_empty_reduction_dim`
+- `var_rejects_singleton_reduction_dim`
+
+修复后验证：
+
+```bash
+cargo test -p candle-core --test tensor_tests var_rejects_ -- --nocapture
+cargo test -p candle-core --test tensor_tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-141-tensor-var-reduction-length`
+- `agent/bug-142-tensor-var-singleton-reduction`
+
+## 一百四十二个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
@@ -2643,6 +2706,7 @@ git diff --check
 - `usize` 的 `len - 1` 是 Rust 代码里常见边界风险点。
 - Tensor view API 的 shape/stride 参数必须先验证再构造；一旦 view 返回 `Ok`，后续算子会信任它。
 - Shape 计算尽量用整数公式，不要把离散维度转成 `f32` 再 cast 回 `usize`。
+- 统计类 API 要把数学定义里的样本数条件写成代码合同，例如 unbiased variance 需要 `n >= 2`。
 - Tensor rank 正确不代表每个维度都非空。
 - 文档注释引用外部 API 时，行为应该尽量匹配读者预期。
 - 模型加载代码里不应该用 `unwrap()` 处理 checkpoint 错误。

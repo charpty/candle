@@ -209,7 +209,7 @@
       <section id="bug" class="panel-section">
         <div class="section-heading">
           <p class="eyebrow">Bug Clinic</p>
-          <h2>真实修复：140 个 public API 边界</h2>
+          <h2>真实修复：142 个 public API 边界</h2>
         </div>
         <div class="bug-grid">
           <article class="bug-card">
@@ -231,6 +231,10 @@
           <article class="bug-card">
             <h3>BUG-139/140</h3>
             <p>`Tensor::unfold` 在构造 view 前拒绝零 step，并把 size 越界错误定位到真实的 `unfold` API。</p>
+          </article>
+          <article class="bug-card">
+            <h3>BUG-141/142</h3>
+            <p>`Tensor::var` 对 unbiased variance 先要求 reduction 长度至少为 2，避免空维度下溢和单元素 NaN。</p>
           </article>
           <article class="bug-card">
             <h3>BUG-004</h3>
