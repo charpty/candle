@@ -1,10 +1,10 @@
-# Candle bug hunt 报告：一百五十八个 public API 边界修复
+# Candle bug hunt 报告：一百六十个 public API 边界修复
 
 本报告记录一次真实源码审计：从 public API 合同出发，找到可复现问题，补测试并修复。
 
 ## 总结
 
-本轮累计修复一百五十八个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
+本轮累计修复一百六十个问题。BUG-001 到 BUG-020 覆盖通用 ops、KV cache、conv、ViT 和 loader
 错误传播；BUG-021 到 BUG-044 继续扩展到 BatchNorm、loss、Mimi transformer、Gemma4 vision/text
 这些更贴近模型配置和训练/推理边界的路径；BUG-045 到 BUG-053 继续覆盖 Gemma4 audio 的
 Conformer attention 和 SSCP conv 配置；BUG-054 到 BUG-056 覆盖 Gemma4 multimodal embedding
@@ -26,7 +26,8 @@ BUG-139 到 BUG-140 覆盖 core `Tensor::unfold` 的窗口步长和错误诊断�
 2D pooling 的 stride/kernel 参数合同；BUG-147 到 BUG-150 覆盖 bilinear upsample scale
 到输出尺寸的派生合同；BUG-151 到 BUG-155 覆盖 upsample 空输入空间维合同。
 BUG-156 覆盖 core `Tensor::get` 对标量非零索引的参数忽略问题；BUG-157 到 BUG-158
-覆盖 core `Tensor::repeat` 的 repeat 维数和零 factor 合同。
+覆盖 core `Tensor::repeat` 的 repeat 维数和零 factor 合同；BUG-159 到 BUG-160 覆盖
+`Tensor::slice_scatter` 的 start 加法溢出合同。
 
 本报告把问题算作 bug 的标准很明确：
 
@@ -195,6 +196,8 @@ BUG-156 覆盖 core `Tensor::get` 对标量非零索引的参数忽略问题；B
 | BUG-156 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | 标量 Tensor 调 `get(1)` 会忽略索引并返回自身 | 保留 `get(0)` 兼容，非零索引返回 `InvalidIndex` |
 | BUG-157 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::repeat(2)` 对二维 Tensor 静默只 repeat 第 0 维 | 要求 repeat 维数至少等于 Tensor rank |
 | BUG-158 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `Tensor::repeat((0, 1))` 把 0 repeat factor 当作 1 并返回原 shape | 入口拒绝任一零 repeat factor |
+| BUG-159 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `slice_scatter0(src, usize::MAX)` 在 `d2 + start` 处溢出 panic | 用 `checked_add` 做 shape 范围校验 |
+| BUG-160 | [candle-core/src/tensor.rs](../candle-core/src/tensor.rs) | `slice_scatter(src, dim != 0, usize::MAX)` 经 transpose 后同样溢出 panic | 同一 `slice_scatter0` 修复覆盖非零维路径 |
 
 ## BUG-001：`replication_pad2d` 的边界行为
 
@@ -3006,7 +3009,54 @@ git diff --check
 - `agent/bug-157-tensor-repeat-validation`
 - `agent/bug-158-tensor-repeat-zero-factor`
 
-## 一百五十八个案例教什么
+## BUG-159 到 BUG-160：`slice_scatter` 的 start 加法溢出
+
+受影响文件：
+
+- [candle-core/src/tensor.rs](../candle-core/src/tensor.rs)
+- [candle-core/tests/tensor_tests.rs](../candle-core/tests/tensor_tests.rs)
+
+`slice_scatter0(src, start)` 会先检查 `src` 是否能放进 `self` 的第 0 维：
+
+```rust
+if 0 == dim_idx {
+    d2 + start <= d1
+} else {
+    d1 == d2
+}
+```
+
+这里 `d2` 是 `src` 在第 0 维的长度，`d1` 是目标 Tensor 的第 0 维长度。普通越界输入应该返回
+shape mismatch，但如果调用方传入 `start = usize::MAX`，`d2 + start` 会在 debug 构建下直接
+溢出 panic。`slice_scatter(src, dim != 0, start)` 通过 transpose 复用 `slice_scatter0`，所以同样受影响。
+
+修复策略：
+
+1. 把 `d2 + start <= d1` 改成 `start.checked_add(d2).is_some_and(|end| end <= d1)`。
+2. 加法溢出时 `checked_add` 返回 `None`，shape check 失败，最终走原有 `ShapeMismatchBinaryOp` 错误。
+3. 正常范围内的 slice scatter 行为不变。
+
+新增测试：
+
+- `slice_scatter0_rejects_overflowing_start`
+- `slice_scatter_rejects_overflowing_start_on_nonzero_dim`
+
+修复后验证：
+
+```bash
+cargo test -p candle-core --test tensor_tests slice_scatter0_rejects_overflowing_start -- --nocapture
+cargo test -p candle-core --test tensor_tests slice_scatter_rejects_overflowing_start -- --nocapture
+cargo test -p candle-core --test tensor_tests
+cargo fmt --all --check
+git diff --check
+```
+
+分支：
+
+- `agent/bug-159-slice-scatter-start-overflow`
+- `agent/bug-160-slice-scatter-nonzero-dim-start-overflow`
+
+## 一百六十个案例教什么
 
 这些都不是复杂算法 bug，但很适合训练源码审计能力：
 
@@ -3021,6 +3071,7 @@ git diff --check
 - 采样类 API 要先证明输入空间维至少有一个可采样位置，再计算 `src_dim - 1` 或邻点索引。
 - 不是所有 bug 都表现为 panic；如果 public API 忽略了调用方传入的参数，也要用 UT 钉住。
 - 当一个 API 的参数列表和 Tensor rank 对齐时，必须校验长度；少传维度不能被当成默认值。
+- `start + len` 这类范围校验要优先用 `checked_add` 或 `saturating_add`，不能先让 `usize` 溢出。
 - Tensor rank 正确不代表每个维度都非空。
 - 文档注释引用外部 API 时，行为应该尽量匹配读者预期。
 - 模型加载代码里不应该用 `unwrap()` 处理 checkpoint 错误。
