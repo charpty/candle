@@ -1203,6 +1203,22 @@ fn slice_scatter(device: &Device) -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn slice_scatter0_rejects_overflowing_start() -> Result<()> {
+    let t = Tensor::zeros((4, 3), DType::F32, &Device::Cpu)?;
+    let src = Tensor::zeros((1, 3), DType::F32, &Device::Cpu)?;
+    assert!(t.slice_scatter0(&src, usize::MAX).is_err());
+    Ok(())
+}
+
+#[test]
+fn slice_scatter_rejects_overflowing_start_on_nonzero_dim() -> Result<()> {
+    let t = Tensor::zeros((4, 3), DType::F32, &Device::Cpu)?;
+    let src = Tensor::zeros((4, 1), DType::F32, &Device::Cpu)?;
+    assert!(t.slice_scatter(&src, 1, usize::MAX).is_err());
+    Ok(())
+}
+
 fn scatter(device: &Device) -> Result<()> {
     let t = Tensor::arange(0f32, 12f32, device)?.reshape((4, 3))?;
     assert_eq!(

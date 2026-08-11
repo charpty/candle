@@ -1774,7 +1774,7 @@ impl Tensor {
                 .enumerate()
                 .all(|(dim_idx, (&d1, &d2))| {
                     if 0 == dim_idx {
-                        d2 + start <= d1
+                        start.checked_add(d2).is_some_and(|end| end <= d1)
                     } else {
                         d1 == d2
                     }
