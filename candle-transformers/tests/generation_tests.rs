@@ -56,6 +56,26 @@ fn sample_with_top_k() -> Result<()> {
 }
 
 #[test]
+fn top_k_then_top_p_uses_filtered_distribution() -> Result<()> {
+    let mut logits_process = LogitsProcessor::from_sampling(
+        42,
+        candle_transformers::generation::Sampling::TopKThenTopP {
+            k: 2,
+            p: 0.5,
+            temperature: 1.0,
+        },
+    );
+    let logits = Tensor::new(
+        &[0.4f32.ln(), 0.3f32.ln(), 0.2f32.ln(), 0.1f32.ln()],
+        &Device::Cpu,
+    )?;
+    for _ in 0..16 {
+        assert_eq!(logits_process.sample(&logits)?, 0);
+    }
+    Ok(())
+}
+
+#[test]
 fn sample_gumbel() -> Result<()> {
     let mut logits_process = LogitsProcessor::from_sampling(
         42,

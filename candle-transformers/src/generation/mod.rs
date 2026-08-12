@@ -105,10 +105,10 @@ impl LogitsProcessor {
                 argsort_indices.select_nth_unstable_by(top_k, |&i, &j| prs[j].total_cmp(&prs[i]));
             let mut prs = indices.iter().map(|&i| prs[i]).collect::<Vec<_>>();
             let sum_p = prs.iter().sum::<f32>();
-            let index = if top_p <= 0.0 || top_p >= sum_p {
+            let index = if top_p <= 0.0 || top_p >= 1.0 {
                 self.sample_multinomial(&prs)?
             } else {
-                self.sample_topp(&mut prs, top_p)?
+                self.sample_topp(&mut prs, top_p * sum_p)?
             };
             Ok(indices[index as usize] as u32)
         }
